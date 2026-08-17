@@ -25,7 +25,7 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   virtual void handle_incoming_can_frame(CAN_frame rx_frame);
   virtual void update_values();
   virtual void transmit_can(unsigned long currentMillis);
-  static constexpr const char* Name = "Renault Twingo Gen1 22";
+  static constexpr const char* Name = "Renault Twingo Gen1 22kWh";
 
   String get_uds_info_html() override;
   const char* get_dtc_json_filename() override { return "renault_zoe_gen1_dtc.json"; }

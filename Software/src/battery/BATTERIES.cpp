@@ -43,6 +43,7 @@
 #include "RELION-LV-BATTERY.h"
 #include "RENAULT-KANGOO-BATTERY.h"
 #include "RENAULT-TWIZY.h"
+#include "RENAULT-TWINGO-GEN1-BATTERY.h"
 #include "RENAULT-ZOE-GEN1-BATTERY.h"
 #include "RENAULT-ZOE-GEN2-BATTERY.h"
 #include "RIVIAN-BATTERY.h"
@@ -173,6 +174,8 @@ const char* name_for_battery_type(BatteryType type) {
       return RenaultKangooBattery::Name;
     case BatteryType::RenaultTwizy:
       return RenaultTwizyBattery::Name;
+    case BatteryType::RenaultTwingo1:
+      return RenaultTwingoGen1Battery::Name;
     case BatteryType::RenaultZoe1:
       return RenaultZoeGen1Battery::Name;
     case BatteryType::RenaultZoe2:
@@ -300,6 +303,8 @@ Battery* create_battery(BatteryType type) {
       return new RenaultKangooBattery();
     case BatteryType::RenaultTwizy:
       return new RenaultTwizyBattery();
+    case BatteryType::RenaultTwingo1:
+      return new RenaultTwingoGen1Battery();
     case BatteryType::RenaultZoe1:
       return new RenaultZoeGen1Battery();
     case BatteryType::RenaultZoe2:
@@ -356,6 +361,7 @@ bool battery_supports_double(BatteryType type) {
     case BatteryType::Pylon:
     case BatteryType::SantaFePhev:
     case BatteryType::RelionBattery:
+    case BatteryType::RenaultTwingo1:
     case BatteryType::RenaultZoe1:
     case BatteryType::RenaultZoe2:
     case BatteryType::TestFake:
@@ -446,6 +452,9 @@ void setup_battery() {
         case BatteryType::RelionBattery:
           battery2 = new RelionBattery(&datalayer.battery2, can_config.battery_double,
                                        &datalayer.system.status.battery2_allowed_contactor_closing);
+          break;
+        case BatteryType::RenaultTwingo1:
+          battery2 = new RenaultTwingoGen1Battery(&datalayer.battery2, can_config.battery_double);
           break;
         case BatteryType::RenaultZoe1:
           battery2 = new RenaultZoeGen1Battery(&datalayer.battery2, can_config.battery_double);

@@ -424,12 +424,14 @@ static void send_battery_frame(uint8_t index) {
     put_u32_field(ESPNOW_KEY_OVERRIDE_DISCHARGE_W, d->status.override_discharge_power_W);
     put_i16_field(ESPNOW_KEY_TEMPERATURE_MAX_DC, d->status.temperature_max_dC);
     put_i16_field(ESPNOW_KEY_TEMPERATURE_MIN_DC, d->status.temperature_min_dC);
+    put_u16_field(ESPNOW_KEY_CELL_MAX_MV, d->status.cell_max_voltage_mV);
+    put_u16_field(ESPNOW_KEY_CELL_MIN_MV, d->status.cell_min_voltage_mV);
 
     const uint8_t cells = d->info.number_of_cells;
-    if (cells != 0u && d->status.cell_voltages_mV[cells - 1] != 0u) {
-      put_u16_field(ESPNOW_KEY_CELL_MAX_MV, d->status.cell_max_voltage_mV);
-      put_u16_field(ESPNOW_KEY_CELL_MIN_MV, d->status.cell_min_voltage_mV);
-    }
+//    if (cells != 0u && d->status.cell_voltages_mV[cells - 1] != 0u) {
+//      put_u16_field(ESPNOW_KEY_CELL_MAX_MV, d->status.cell_max_voltage_mV);
+//      put_u16_field(ESPNOW_KEY_CELL_MIN_MV, d->status.cell_min_voltage_mV);
+//    }
 
     if (bat != nullptr && bat->supports_charged_energy()) {
       put_i32_field(ESPNOW_KEY_TOTAL_CHARGED_WH, d->status.total_charged_battery_Wh);

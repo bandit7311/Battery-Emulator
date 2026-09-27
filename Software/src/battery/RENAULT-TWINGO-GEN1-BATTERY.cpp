@@ -40,6 +40,36 @@ void RenaultTwingoGen1Battery::
   }
 
 #ifdef TWINGO_EXTENDED_CELL_POLLING
+  // Single pack temperature sensors (0x9131-0x9138): first drop every sensor that has stopped
+  // answering, then - only if all 8 are plausible and fresh - derive pack min/max from them
+  // (0.1 degC resolution) instead of the 0x424 broadcast values assigned further up (1 degC
+  // resolution). Otherwise the broadcast values simply stay in place.
+  {
+    unsigned long now = millis();
+    uint8_t mask = datalayer_battery->status.temperature_sensors_valid_mask;
+    for (uint8_t i = 0; i < EXT_TEMP_SENSOR_COUNT; i++) {
+      if ((mask & (1u << i)) && ((now - ext_temp_last_ms[i]) > EXT_TEMP_STALE_MS)) {
+        mask &= (uint8_t)~(1u << i);
+      }
+    }
+    datalayer_battery->status.temperature_sensors_valid_mask = mask;
+    if (mask == 0xFF) {
+      int16_t t_min = datalayer_battery->status.temperature_sensors_dC[0];
+      int16_t t_max = t_min;
+      for (uint8_t i = 1; i < EXT_TEMP_SENSOR_COUNT; i++) {
+        int16_t t = datalayer_battery->status.temperature_sensors_dC[i];
+        if (t < t_min) {
+          t_min = t;
+        }
+        if (t > t_max) {
+          t_max = t;
+        }
+      }
+      datalayer_battery->status.temperature_min_dC = t_min;
+      datalayer_battery->status.temperature_max_dC = t_max;
+    }
+  }
+
   // Once every one of the 96 cells has replied at least once via the extended
   // channel, use the real per-cell values instead of the coarse 0x425-broadcast
   // approximation (10mV resolution, always a multiple of 10) for pack voltage,
@@ -155,10 +185,47 @@ void RenaultTwingoGen1Battery::handle_extended_single_frame(uint16_t pid, const 
     if (cell_index < 0 || cell_index >= 96) {
       return;  // Shouldn't happen given the range check above, but be safe.
     }
+    uint16_t cell_mV = (uint16_t)(((data[0] << 8) | data[1]) * 0.976563f);
+    unsigned long now = millis();
+    if (ext_first_cell_reply_ms == 0) {
+      ext_first_cell_reply_ms = (now != 0) ? now : 1;  // 0 is reserved for "no reply yet"
+    }
+    // Boot plausibility filter (see header): only 3.0-4.3V count until all 96 cells have been
+    // read once or 60s have passed since the first cell reply. Dropped values are neither
+    // stored nor counted; an already stored plausible value stays untouched.
+    // The filter is also armed again for 60s after the NVROL quiet phase (BMS wake-up, see finish_nvrol_silence).
+    bool boot_phase = ((ext_cells_seen < 96) && ((now - ext_first_cell_reply_ms) < EXT_BOOT_FILTER_TIMEOUT_MS)) ||
+                      (ext_filter_rearm_active && ((now - ext_filter_rearm_start_ms) < EXT_BOOT_FILTER_TIMEOUT_MS));
+    if (boot_phase && (cell_mV < EXT_BOOT_CELL_MV_MIN || cell_mV > EXT_BOOT_CELL_MV_MAX)) {
+#ifdef EXTENDED_UDS_DEBUG
+      logging.printf("EXT UDS: boot filter dropped cell %d = %u mV\n", cell_index + 1, (unsigned)cell_mV);
+#endif
+      return;
+    }
     if (datalayer_battery->status.cell_voltages_mV[cell_index] == 0 && ext_cells_seen < 96) {
       ext_cells_seen++;
     }
-    datalayer_battery->status.cell_voltages_mV[cell_index] = (uint16_t)(((data[0] << 8) | data[1]) * 0.976563f);
+    datalayer_battery->status.cell_voltages_mV[cell_index] = cell_mV;
+    return;
+  }
+
+  if (pid >= EXT_POLL_TEMP_FIRST && pid < (uint16_t)(EXT_POLL_TEMP_FIRST + EXT_TEMP_SENSOR_COUNT)) {
+    // Pack temperature sensor 1-8: 16-bit raw, degC = raw * 0.0625 - 40 (same as OVMS RT32), stored
+    // in d°C = raw * 0.625 - 400. Raw 0 (-40.0 degC) and everything above +100.0 degC (e.g. 0xFFFF)
+    // is treated as "no valid value" - the sensor then shows "--" and blocks the min/max feed.
+    if (length < 2) {
+      return;
+    }
+    uint8_t sensor = (uint8_t)(pid - EXT_POLL_TEMP_FIRST);
+    uint16_t raw = (uint16_t)((data[0] << 8) | data[1]);
+    int32_t temp_dC = (int32_t)(raw * 0.625f + 0.5f) - 400;
+    if (temp_dC > -400 && temp_dC <= 1000) {
+      datalayer_battery->status.temperature_sensors_dC[sensor] = (int16_t)temp_dC;
+      datalayer_battery->status.temperature_sensors_valid_mask |= (uint8_t)(1u << sensor);
+      ext_temp_last_ms[sensor] = millis();
+    } else {
+      datalayer_battery->status.temperature_sensors_valid_mask &= (uint8_t)~(1u << sensor);
+    }
     return;
   }
 
@@ -188,7 +255,35 @@ void RenaultTwingoGen1Battery::handle_extended_single_frame(uint16_t pid, const 
       break;
     case EXT_POLL_TEMPORISATION:  // 0x9281, top bit of byte 0 (mirrors Zoe Gen2's own reading of this PID)
       if (length >= 1) {
-        battery_temporisation = data[0] >> 7;
+        // Raw byte is kept: the flag is bit 0 per the CanZE field list (bit 31 of the frame, 0 = temporisation
+        // active, 1 = deactivated), not the top bit that the Zoe Ph2 driver evaluates.
+        battery_temporisation = data[0];
+        priority_answered(1);
+      }
+      break;
+    case EXT_POLL_BAL_CAP_TOTAL:  // 0x924F-0x9252 and 0x9262/0x9263: balancing counters, raw 32-bit
+    case EXT_POLL_BAL_TIME_TOTAL:  // (see bal_counter_value). 0x9262/0x9263 aren't contiguous with the
+    case EXT_POLL_BAL_CAP_SLEEP:   // rest, so their array index is set explicitly instead of by offset.
+    case EXT_POLL_BAL_TIME_SLEEP:
+    case EXT_POLL_BAL_CAP_WAKE:
+    case EXT_POLL_BAL_TIME_WAKE:
+      if (length >= 4) {
+        uint8_t idx;
+        if (pid == EXT_POLL_BAL_CAP_WAKE) {
+          idx = 4;
+        } else if (pid == EXT_POLL_BAL_TIME_WAKE) {
+          idx = 5;
+        } else {
+          idx = (uint8_t)(pid - EXT_POLL_BAL_CAP_TOTAL);
+        }
+        bal_raw[idx] =
+            ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | (uint32_t)data[3];
+        bal_valid[idx] = true;
+        if (pid == EXT_POLL_BAL_CAP_SLEEP) {
+          priority_answered(2);
+        } else if (pid == EXT_POLL_BAL_TIME_SLEEP) {
+          priority_answered(3);
+        }
       }
       break;
     default:  // Unknown/unrequested PID, ignore
@@ -231,6 +326,15 @@ void RenaultTwingoGen1Battery::handle_extended_multiframe_complete() {
     return;  // Not even enough for an echoed SID+PID
   }
   uint16_t pid = (ext_isotp_buffer[1] << 8) | ext_isotp_buffer[2];
+  if (pid == EXT_POLL_BMS_STATE) {
+    // 0x9270: 32 bytes after SID+PID (35 bytes in total)
+    if (ext_isotp_received_len >= 3 + 32) {
+      memcpy(bms_state_raw, &ext_isotp_buffer[3], sizeof(bms_state_raw));
+      bms_state_valid = true;
+      priority_answered(0);
+    }
+    return;
+  }
   if (pid != EXT_POLL_BALANCE_SWITCHES) {
     return;  // Nothing else expected to arrive as multi-frame
   }
@@ -357,6 +461,21 @@ void RenaultTwingoGen1Battery::handle_extended_reply(CAN_frame rx_frame) {
 // that distinction is the whole point: it tells us whether e.g. the routine
 // or the write is actively rejected, versus never answered at all.
 void RenaultTwingoGen1Battery::handle_nvrol_reply(CAN_frame rx_frame) {
+  if (NVROLstateMachine == 5) {
+    // Quiet phase: only record what the BMS sends on 0x18DAF1DB (e.g. a late answer to routine B009),
+    // never answer it - no flow control, nothing is transmitted.
+    if (nvrol_silence_reply_total < 0xFFFF) {
+      nvrol_silence_reply_total++;
+    }
+    if (nvrol_silence_reply_count < NVROL_SILENCE_REPLY_MAX) {
+      NvrolSilenceReply& r = nvrol_silence_reply[nvrol_silence_reply_count++];
+      r.t_ms = (uint16_t)(millis() - nvrol_silence_start_ms);
+      for (uint8_t i = 0; i < 8; i++) {
+        r.d[i] = rx_frame.data.u8[i];
+      }
+    }
+    return;
+  }
   uint8_t step = nvrol_awaiting_step;
   if (step >= NVROL_LOG_STEPS) {
     return;
@@ -374,6 +493,10 @@ void RenaultTwingoGen1Battery::handle_nvrol_reply(CAN_frame rx_frame) {
     snprintf(nvrol_log[step], sizeof(nvrol_log[step]), "OK raw=%02X %02X %02X %02X %02X %02X %02X",
              rx_frame.data.u8[1], rx_frame.data.u8[2], rx_frame.data.u8[3], rx_frame.data.u8[4], rx_frame.data.u8[5],
              rx_frame.data.u8[6], rx_frame.data.u8[7]);
+    if (step == 4 && pci >= 4 && rx_frame.data.u8[1] == 0x62 && rx_frame.data.u8[2] == 0x92 &&
+        rx_frame.data.u8[3] == 0x81) {
+      temporisation_readback = rx_frame.data.u8[4];  // 0x9281 as the BMS holds it right after the write
+    }
   }
 }
 
@@ -384,15 +507,72 @@ void RenaultTwingoGen1Battery::handle_nvrol_reply(CAN_frame rx_frame) {
 // Timing (100ms/1s/100ms gaps between steps) matches Battery-Emulator's own
 // proven Zoe Ph2 sequence exactly; only the final 30s software-sleep step is
 // omitted on purpose.
+// Enter the shutdown sequence (state 7): 0x350 will start walking C3 -> C2 -> C0 -> 00.
+void RenaultTwingoGen1Battery::start_powerdown(void) {
+  powerdown_stage = 0;
+  powerdown_start_ms = millis();
+  powerdown_stage_start_ms = powerdown_start_ms;
+  previousMillis_350 = 0;
+  NVROLstateMachine = 7;
+}
+
+// Enter the wake-up burst (state 8): 0x350 = C0 once, then C3 x10. Also starts the "how fast does the
+// BMS come back" timers, so they cover the whole wake-up, not just what happens after it.
+void RenaultTwingoGen1Battery::start_wake_burst(void) {
+  // True silence ends here (transmission resumes with the first burst frame), so this is when the
+  // displayed "silent for" duration should stop counting - not once the burst itself has also finished.
+  nvrol_silence_end_ms = millis();
+  wake_burst_index = 0;
+  wake_burst_last_ms = 0;
+  wake_tracking = true;
+  wake_start_ms = millis();
+  wake_first_rx = -1;
+  wake_first_uds = -1;
+  wake_priority_done = -1;
+  wake_priority_timeout = false;
+  NVROLstateMachine = 8;
+}
+
 void RenaultTwingoGen1Battery::transmit_reset_nvrol_frames(void) {
   switch (NVROLstateMachine) {
     case 0:
       startTimeNVROL = millis();
+      // Values right before the reset, for the before/after comparison on the web page
+      nvrol_before.state_valid = bms_state_valid;
+      memcpy(nvrol_before.state, bms_state_raw, sizeof(nvrol_before.state));
+      for (uint8_t i = 0; i < 4; i++) {
+        nvrol_before.bal_raw[i] = bal_raw[i];
+        nvrol_before.bal_valid[i] = bal_valid[i];
+      }
+      nvrol_before.temporisation = battery_temporisation;
+      memset(nvrol_silence_rx_per_s, 0, sizeof(nvrol_silence_rx_per_s));
+      memset(nvrol_silence_rx_per_10s, 0, sizeof(nvrol_silence_rx_per_10s));
+      memset(nvrol_silence_ids, 0, sizeof(nvrol_silence_ids));
+      nvrol_silence_id_count = 0;
+      nvrol_silence_id_other = 0;
+      nvrol_silence_end_ms = 0;
+      wake_tracking = false;
+      temporisation_readback = 0x100;
+      nvrol_silence_rx_total = 0;
+      nvrol_silence_last_rx_ms = 0;
+      nvrol_silence_reply_count = 0;
+      nvrol_silence_reply_total = 0;
+      nvrol_silence_done = false;
       for (uint8_t i = 0; i < NVROL_LOG_STEPS; i++) {
         strncpy(nvrol_log[i], "no response", sizeof(nvrol_log[i]) - 1);
         nvrol_log[i][sizeof(nvrol_log[i]) - 1] = '\0';
       }
       nvrol_awaiting_step = 0;
+      if (nvrol_mode == 1) {
+        // "Sleep": nothing else is sent, go straight into the shutdown sequence (0x350 walking
+        // C3 -> C2 -> C0 -> 00), true silence follows once it reaches 00.
+        for (uint8_t i = 0; i < NVROL_LOG_STEPS; i++) {
+          strncpy(nvrol_log[i], "not sent (Sleep)", sizeof(nvrol_log[i]) - 1);
+        }
+        ext_isotp_in_progress = false;
+        start_powerdown();
+        break;
+      }
       // NVROL reset, part 1: open extended diagnostic session (SID 0x10, subfunction 0x03)
       ZOE_POLL_18DADBF1.data = {0x02, 0x10, 0x03, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
       transmit_can_frame(&ZOE_POLL_18DADBF1);
@@ -402,6 +582,17 @@ void RenaultTwingoGen1Battery::transmit_reset_nvrol_frames(void) {
       NVROLstateMachine = 1;
       break;
     case 1:  // wait 100ms for step 0's response
+      if ((millis() - startTimeNVROL) > INTERVAL_100_MS && nvrol_mode == 2) {
+        // "Sleep 0x9281=1": no reset routine, straight to the temporisation write (session is already open)
+        strncpy(nvrol_log[1], "skipped (Sleep 0x9281=1)", sizeof(nvrol_log[1]) - 1);
+        strncpy(nvrol_log[2], "skipped (Sleep 0x9281=1)", sizeof(nvrol_log[2]) - 1);
+        ZOE_POLL_18DADBF1.data = {0x04, 0x2E, 0x92, 0x81, 0x01, 0xAA, 0xAA, 0xAA};
+        transmit_can_frame(&ZOE_POLL_18DADBF1);
+        nvrol_awaiting_step = 3;
+        startTimeNVROL = millis();
+        NVROLstateMachine = 4;
+        break;
+      }
       if ((millis() - startTimeNVROL) > INTERVAL_100_MS) {
         // NVROL reset, part 2: RoutineControl (SID 0x31) start routine (0x01) 0xB009
         ZOE_POLL_18DADBF1.data = {0x04, 0x31, 0x01, 0xB0, 0x09, 0x00, 0xAA, 0xAA};
@@ -440,31 +631,625 @@ void RenaultTwingoGen1Battery::transmit_reset_nvrol_frames(void) {
         NVROLstateMachine = 4;
       }
       break;
-    case 4:  // wait 100ms for step 3's response, then finish
+    case 4:  // wait 100ms for step 3's response, then read 0x9281 back
       if ((millis() - startTimeNVROL) > INTERVAL_100_MS) {
+        // Read the temporisation flag back right away: does the BMS keep what was just written?
+        ZOE_POLL_18DADBF1.data = {0x03, 0x22, 0x92, 0x81, 0x00, 0x00, 0x00, 0x00};
+        transmit_can_frame(&ZOE_POLL_18DADBF1);
+        nvrol_awaiting_step = 4;
 #ifdef EXTENDED_UDS_DEBUG
-        logging.println("NVROL: sequence complete");
+        logging.println("NVROL: step 4 - read 0x9281 back");
 #endif
-        // Restore the poll frame to its normal read template - we're done with
-        // the special sequence, normal extended polling resumes next cycle.
-        ZOE_POLL_18DADBF1.data = {0x03, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-        ext_poll_index = 0;
-        UserRequestNVROLReset = false;
-        NVROLstateMachine = 0;
-        // No software sleep step here - see header comment. Letting the
-        // battery actually sleep/save is done manually (12V/contactors) by
-        // the user after this sequence finishes.
+        startTimeNVROL = millis();
+        NVROLstateMachine = 6;
       }
       break;
+    case 6:  // wait 150ms for the read-back, then start the shutdown sequence
+      if ((millis() - startTimeNVROL) > 150) {
+#ifdef EXTENDED_UDS_DEBUG
+        logging.println("NVROL: sequence complete, shutdown sequence starts");
+#endif
+        // Restore the poll frame to its normal read template - we're done with the special sequence.
+        ZOE_POLL_18DADBF1.data = {0x03, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+        ext_isotp_in_progress = false;
+        start_powerdown();
+      }
+      break;
+    case 7: {  // Shutdown sequence: 0x350 walks C3 -> C2 -> C0 -> 00, own frames keep running (see
+               // transmit_can()) until the 00 stage begins, then true silence (state 5) follows.
+      unsigned long now = millis();
+      static const uint8_t stage_byte0[4] = {0xC3, 0xC2, 0xC0, 0x00};
+      static const unsigned long stage_duration_ms[4] = {POWERDOWN_C3_MS, POWERDOWN_C2_MS, POWERDOWN_C0_MS,
+                                                          POWERDOWN_00_MS};
+      if (now - previousMillis_350 >= INTERVAL_350_MS) {
+        previousMillis_350 = now;
+        send_vehicle_state_350(stage_byte0[powerdown_stage]);
+      }
+      if (nvrol_wake_request) {
+        start_wake_burst();
+        break;
+      }
+      if (now - powerdown_stage_start_ms >= stage_duration_ms[powerdown_stage]) {
+        if (powerdown_stage + 1 >= 4) {
+          // The 00 stage's own duration has elapsed too: stop everything, true silence begins.
+          nvrol_silence_start_ms = now;
+          nvrol_silence_last_rx_ms = 0;
+          NVROLstateMachine = 5;
+        } else {
+          powerdown_stage++;
+          powerdown_stage_start_ms = now;
+        }
+      }
+      break;
+    }
+    case 5:  // true silence: nothing is transmitted at all (see transmit_can()), only the timer runs
+      if (nvrol_wake_request || (millis() - nvrol_silence_start_ms) >= SLEEP_MANUAL_FAILSAFE_MS) {
+#ifdef EXTENDED_UDS_DEBUG
+        logging.println("NVROL: true silence over, waking up");
+#endif
+        start_wake_burst();
+      }
+      break;
+    case 8: {  // Wake-up burst: 0x350 = C0 once, then C3 x10, 200ms apart, before normal polling resumes
+      unsigned long now = millis();
+      if (now - wake_burst_last_ms >= WAKE_BURST_INTERVAL_MS) {
+        wake_burst_last_ms = now;
+        send_wake_burst_frame(wake_burst_index);
+        wake_burst_index++;
+      }
+      if (wake_burst_index > WAKE_BURST_COUNT) {
+        finish_nvrol_silence();
+      }
+      break;
+    }
     default:  // Something went wrong; reset state machine
       NVROLstateMachine = 0;
+      nvrol_mode = 0;
       UserRequestNVROLReset = false;
       break;
   }
 }
+
+// End of the quiet phase: from the next transmit_can() call on all frames are sent again, which wakes
+// the BMS. It then behaves like after a boot, so the values are marked as unread, the cell plausibility
+// filter is armed again and a few PIDs are asked with priority until they have answered.
+// Called once the wake-up burst (state 8) has finished: the BMS/vehicle has had its wake signal, normal
+// polling resumes from here. wake_tracking/wake_start_ms/wake_first_* were already set by
+// start_wake_burst() when the burst began, so the "how fast did it come back" timers cover the burst too.
+void RenaultTwingoGen1Battery::finish_nvrol_silence(void) {
+  nvrol_silence_done = true;
+  nvrol_last_mode = nvrol_mode;
+  nvrol_mode = 0;
+  nvrol_wake_request = false;
+  bms_state_valid = false;
+  for (uint8_t i = 0; i < 4; i++) {
+    bal_valid[i] = false;
+  }
+  battery_temporisation = 0x100;
+  ext_filter_rearm_active = true;
+  ext_filter_rearm_start_ms = millis();
+  ext_isotp_in_progress = false;
+  ext_poll_index = 0;
+  ext_priority_pending_mask = 0x0F;
+  ext_priority_next = 0;
+  ext_priority_start_ms = millis();
+  previousMillisExtPoll = millis();  // first poll after the restart follows 200ms later
+  UserRequestNVROLReset = false;
+  NVROLstateMachine = 0;
+}
+
+// Free-running minute counter for byte 3 of 0x350 (matches the real vehicle's own counter, see
+// Log_Twingo_Ladung.log) - ticks every 60s regardless of state, including through true silence, so it
+// stays correct once transmission resumes. Costs nothing when nothing is sent.
+void RenaultTwingoGen1Battery::tick_minute_counter(void) {
+  unsigned long now = millis();
+  if (vehicle_minute_counter_last_ms == 0) {
+    vehicle_minute_counter_last_ms = now;
+    return;
+  }
+  while (now - vehicle_minute_counter_last_ms >= 60000UL) {
+    vehicle_minute_counter_last_ms += 60000UL;
+    vehicle_minute_counter++;
+  }
+}
+
+// One 0x350 frame for the shutdown sequence (case 7): bytes 5/6/7 depend only on whether the state is the
+// "active" family (C3/C2, stable value from the log) or the "sleeping" family (C0/00, likewise stable).
+void RenaultTwingoGen1Battery::send_vehicle_state_350(uint8_t byte0) {
+  uint8_t b5, b7;
+  if (byte0 == 0xC0 || byte0 == 0x00) {
+    b5 = 0x70;
+    b7 = 0x85;
+  } else {  // C3 or C2
+    b5 = 0x14;
+    b7 = 0x45;
+  }
+  CAN_frame f = {.FD = false,
+                 .ext_ID = false,
+                 .DLC = 8,
+                 .ID = 0x350,
+                 .data = {byte0, 0x26, 0x64, vehicle_minute_counter, 0x14, b5, 0x96, b7}};
+  transmit_can_frame(&f);
+}
+
+// One 0x350 frame for the wake-up burst (case 8): the real vehicle briefly keeps the old C0-style bytes
+// for the first C3 frame, then settles - captured in Log_Twingo_Ladung.log around 10:48:55.
+void RenaultTwingoGen1Battery::send_wake_burst_frame(uint8_t index) {
+  uint8_t byte0, b5, b7;
+  if (index == 0) {
+    byte0 = 0xC0;
+    b5 = 0x70;
+    b7 = 0x85;
+  } else if (index == 1) {
+    byte0 = 0xC3;
+    b5 = 0x70;
+    b7 = 0x85;
+  } else if (index == 2) {
+    byte0 = 0xC3;
+    b5 = 0x10;
+    b7 = 0x45;
+  } else {
+    byte0 = 0xC3;
+    b5 = 0x14;
+    b7 = 0x45;
+  }
+  CAN_frame f = {.FD = false,
+                 .ext_ID = false,
+                 .DLC = 8,
+                 .ID = 0x350,
+                 .data = {byte0, 0x26, 0x64, vehicle_minute_counter, 0x14, b5, 0x96, b7}};
+  transmit_can_frame(&f);
+}
+
+static const char* bms_state_name(uint8_t v) {
+  switch (v) {
+    case 1:
+      return "Init";
+    case 2:
+      return "Wait";
+    case 3:
+      return "Isolated Charge";
+    case 4:
+      return "Non Isolated Charge";
+    case 5:
+      return "External Charge";
+    case 6:
+      return "Driving";
+    case 7:
+      return "SleepTransient";
+    case 8:
+      return "DC Charging without RISOL";
+    case 9:
+      return "DC Charging with RISOL";
+    default:
+      return "?";
+  }
+}
+
+static void append_hex_bytes(String& s, const uint8_t* d, uint8_t n) {
+  char b[4];
+  for (uint8_t i = 0; i < n; i++) {
+    snprintf(b, sizeof(b), "%02X", d[i]);
+    s += b;
+    if (i + 1 < n) {
+      s += ' ';
+    }
+  }
+}
+
+// Balancing counters (0x924F-0x9252) are signed 32-bit values with an offset of -2^31 and a factor of
+// 1/1024 (CanZE field list): value = (raw XOR 0x80000000) / 1024. The raw value is always shown too.
+static float bal_counter_value(uint32_t raw) {
+  return (float)((double)(raw ^ 0x80000000u) / 1024.0);
+}
+
+// Live BMS state (all 32 bytes, first and last decoded) and the balancing counters.
+void RenaultTwingoGen1Battery::append_live_html(String& s) {
+  s += "BMS State (0x9270): ";
+  if (!bms_state_valid) {
+    s += "not yet read";
+  } else {
+    append_hex_bytes(s, bms_state_raw, 32);
+    s += " (first: ";
+    s += bms_state_name(bms_state_raw[0]);
+    s += ", last: ";
+    s += bms_state_name(bms_state_raw[31]);
+    s += ")";
+  }
+  s += "<br>";
+  for (uint8_t line = 0; line < 3; line++) {
+    uint8_t cap = line * 2;
+    uint8_t tim = line * 2 + 1;
+    if (line == 0) {
+      s += "Balancing total (0x924F/0x9250): ";
+    } else if (line == 1) {
+      s += "Balancing in sleep (0x9251/0x9252): ";
+    } else {
+      s += "Balancing while awake (0x9262/0x9263): ";
+    }
+    if (!bal_valid[cap] || !bal_valid[tim]) {
+      s += "not yet read<br>";
+      continue;
+    }
+    s += String(bal_counter_value(bal_raw[cap]), 3);
+    s += " Ah / ";
+    s += String(bal_counter_value(bal_raw[tim]), 3);
+    s += " h (raw ";
+    char b[24];
+    snprintf(b, sizeof(b), "%08lX / %08lX", (unsigned long)bal_raw[cap], (unsigned long)bal_raw[tim]);
+    s += b;
+    s += ")<br>";
+  }
+}
+
+void RenaultTwingoGen1Battery::priority_answered(uint8_t bit) {
+  ext_priority_pending_mask &= (uint8_t)~(1u << bit);
+  if (ext_priority_pending_mask == 0 && wake_tracking && wake_priority_done < 0) {
+    wake_priority_done = (int32_t)(millis() - wake_start_ms);
+  }
+}
+
+void RenaultTwingoGen1Battery::record_silence_frame(const CAN_frame& f) {
+  unsigned long now = millis();
+  unsigned long dt = now - powerdown_start_ms;  // one continuous timeline from the shutdown sequence's start
+  unsigned long sec = dt / 1000;
+  if (sec < SILENCE_SEC_BUCKETS && nvrol_silence_rx_per_s[sec] < 0xFFFF) {
+    nvrol_silence_rx_per_s[sec]++;
+  }
+  unsigned long b10 = dt / 10000;
+  if (b10 < SILENCE_10S_BUCKETS && nvrol_silence_rx_per_10s[b10] < 0xFFFF) {
+    nvrol_silence_rx_per_10s[b10]++;
+  }
+  nvrol_silence_rx_total++;
+  nvrol_silence_last_rx_ms = now;
+
+  const uint8_t n = (f.DLC > 8) ? 8 : f.DLC;  // only the bytes the frame really carries
+  SilenceId* rec = nullptr;
+  for (uint8_t i = 0; i < nvrol_silence_id_count; i++) {
+    if (nvrol_silence_ids[i].id == f.ID) {
+      rec = &nvrol_silence_ids[i];
+      break;
+    }
+  }
+  if (!rec) {
+    if (nvrol_silence_id_count >= SILENCE_ID_MAX) {
+      nvrol_silence_id_other++;
+      return;
+    }
+    rec = &nvrol_silence_ids[nvrol_silence_id_count++];
+    rec->id = f.ID;
+    rec->count = 0;
+    rec->changes = 0;
+    rec->chg_count = 0;
+    rec->chg_next = 0;
+    memset(rec->first, 0, 8);
+    memset(rec->last, 0, 8);
+    memcpy(rec->first, f.data.u8, n);
+    memcpy(rec->last, f.data.u8, n);
+  }
+  // Data change: remember the last three (time, new data, which bytes differed)
+  uint8_t mask = 0;
+  for (uint8_t i = 0; i < n; i++) {
+    if (rec->last[i] != f.data.u8[i]) {
+      mask |= (uint8_t)(1u << i);
+    }
+  }
+  if (mask != 0) {
+    if (rec->changes < 0xFFFF) {
+      rec->changes++;
+    }
+    SilenceChange& ch = rec->chg[rec->chg_next];
+    rec->chg_next = (uint8_t)((rec->chg_next + 1) % 3);
+    if (rec->chg_count < 3) {
+      rec->chg_count++;
+    }
+    ch.t_ms = (uint32_t)dt;
+    ch.mask = mask;
+    memset(ch.d, 0, 8);
+    memcpy(ch.d, f.data.u8, n);
+  }
+  memcpy(rec->last, f.data.u8, n);
+  rec->dlc = f.DLC;
+  rec->last_ms = now;
+  rec->count++;
+}
+
+// Temporisation (0x9281) as received: raw byte plus bit 0 and bit 7, no interpretation.
+static String temporisation_text(uint16_t v) {
+  if (v >= 0x100) {
+    return String("not yet read");
+  }
+  char b[48];
+  snprintf(b, sizeof(b), "raw 0x%02X (bit0=%u, bit7=%u)", (unsigned)v, (unsigned)(v & 1), (unsigned)((v >> 7) & 1));
+  return String(b);
+}
+
+// Hex bytes; bytes whose bit is set in `mask` are put in [brackets] (the ones that changed).
+static void append_hex_marked(String& s, const uint8_t* d, uint8_t n, uint8_t mask) {
+  char b[8];
+  for (uint8_t i = 0; i < n; i++) {
+    snprintf(b, sizeof(b), (mask & (1u << i)) ? "[%02X]" : "%02X", d[i]);
+    s += b;
+    if (i + 1 < n) {
+      s += ' ';
+    }
+  }
+}
+
+static void append_secs(String& s, long ms) {
+  char b[24];
+  snprintf(b, sizeof(b), "%ld.%ld s", ms / 1000, (ms % 1000) / 100);
+  s += b;
+}
+
+static void append_mmss(String& s, unsigned long ms) {
+  char b[16];
+  unsigned long t = ms / 1000;
+  snprintf(b, sizeof(b), "%02lu:%02lu", t / 60, t % 60);
+  s += b;
+}
+
+// Sleep / quiet phase display: timer since nothing is sent, live BMS frame counter, per second and per
+// 10 s history, when the BMS went silent, every CAN ID heard (which stops first, what changes), late
+// replies and the values from before the run.
+void RenaultTwingoGen1Battery::append_quiet_html(String& s) {
+  const bool quiet = (NVROLstateMachine == 5);
+  const bool active = UserRequestNVROLReset;
+  const uint8_t mode = active ? nvrol_mode : nvrol_last_mode;
+  const unsigned long now = millis();
+  char b[120];
+
+  if (mode == 1) {
+    s += "Sleep (nothing sent at all, until Wake up): ";
+  } else if (mode == 2) {
+    s += "Sleep 0x9281=1 (temporisation written, then nothing sent until Wake up): ";
+  } else {
+    s += "NVROL reset (nothing sent after the sequence, until Wake up): ";
+  }
+  if (quiet) {
+    unsigned long elapsed = now - nvrol_silence_start_ms;
+    s += "<b>SILENT for ";
+    append_mmss(s, elapsed);
+    s += "</b> (safety limit 30:00) - nothing is sent, do not cut the 12V supply<br>";
+  } else if (NVROLstateMachine == 7) {
+    static const char* stage_names[4] = {"C3 (BAT TEMPO LEVEL)", "C2 (CUT OFF PENDING)", "C0 (SLEEPING)",
+                                          "00"};
+    s += "<b>vehicle state ";
+    s += stage_names[powerdown_stage];
+    s += "</b>, this stage for ";
+    append_mmss(s, now - powerdown_stage_start_ms);
+    s += ", shutdown running for ";
+    append_mmss(s, now - powerdown_start_ms);
+    s += " - our own frames still run, do not cut the 12V supply<br>";
+  } else if (NVROLstateMachine == 8) {
+    snprintf(b, sizeof(b), "<b>waking up</b> - sending burst frame %u/%u<br>", (unsigned)wake_burst_index,
+             (unsigned)(WAKE_BURST_COUNT + 1));
+    s += b;
+  } else if (active) {
+    s += "sequence running, silence follows<br>";
+  } else if (!nvrol_silence_done) {
+    s += "not run yet<br>";
+  } else {
+    s += "finished, silent for ";
+    append_mmss(s, nvrol_silence_end_ms - nvrol_silence_start_ms);
+    s += "<br>";
+  }
+  // During the wake-up burst (state 8) the info from the just-finished silence phase (frame counts,
+  // ID table, ...) and the wake-timing line below are still worth showing, even though nvrol_silence_done
+  // is only set true once the burst itself has also finished.
+  // The recording (buckets/ID table below) now runs the whole way from the shutdown sequence's start
+  // (state 7) through true silence (state 5), so it is shown live during state 7 too, not just once the
+  // whole run is finished or genuinely silent.
+  if (!quiet && !nvrol_silence_done && NVROLstateMachine != 8 && NVROLstateMachine != 7) {
+    return;
+  }
+
+  const unsigned long duration_ms = (quiet || NVROLstateMachine == 7) ? (now - powerdown_start_ms)
+                                                                       : (nvrol_silence_end_ms - powerdown_start_ms);
+
+  snprintf(b, sizeof(b), "BMS frames received: <b>%lu</b>", (unsigned long)nvrol_silence_rx_total);
+  s += b;
+  if (quiet || NVROLstateMachine == 7) {
+    if (nvrol_silence_rx_total == 0) {
+      s += " - none so far";
+    } else {
+      unsigned long age = now - nvrol_silence_last_rx_ms;
+      snprintf(b, sizeof(b), ", last one %lu.%lu s ago", age / 1000, (age % 1000) / 100);
+      s += b;
+      if (age > 3000) {
+        s += " - <b>BMS SILENT since ";
+        // Relative to true silence's own start while quiet (unchanged); during state 7, true silence has
+        // not begun yet, so use the shutdown sequence's start instead - the same base the table below uses.
+        append_mmss(s, quiet ? (nvrol_silence_last_rx_ms - nvrol_silence_start_ms)
+                              : (nvrol_silence_last_rx_ms - powerdown_start_ms));
+        s += "</b>";
+      }
+    }
+  }
+  s += "<br>Frames per second (first 60 s): ";
+  unsigned long shown = duration_ms / 1000 + 1;
+  if (shown > 60) {
+    shown = 60;
+  }
+  for (unsigned long i = 0; i < shown; i++) {
+    snprintf(b, sizeof(b), "%u", (unsigned)nvrol_silence_rx_per_s[i]);
+    s += b;
+    if (i + 1 < shown) {
+      s += ',';
+    }
+  }
+  s += "<br>";
+  if (duration_ms >= 60000) {
+    s += "Frames per 10 s (from 01:00): ";
+    unsigned long last_bucket = duration_ms / 10000;
+    if (last_bucket >= SILENCE_10S_BUCKETS) {
+      last_bucket = SILENCE_10S_BUCKETS - 1;
+    }
+    for (unsigned long i = 6; i <= last_bucket; i++) {
+      snprintf(b, sizeof(b), "%u", (unsigned)nvrol_silence_rx_per_10s[i]);
+      s += b;
+      if (i < last_bucket) {
+        s += ',';
+      }
+    }
+    s += "<br>";
+  }
+
+  // The "Result" verdict is only meaningful once the run has actually finished (or is genuinely silent):
+  // during state 7 the BMS is expected to keep sending normally the whole time (our own frames still run),
+  // so there is nothing to conclude yet.
+  if (!quiet && nvrol_silence_done) {
+    if (nvrol_silence_rx_total == 0) {
+      s += "Result: no BMS frame at all - it was already silent when the shutdown sequence began.<br>";
+    } else if (nvrol_silence_last_rx_ms <= nvrol_silence_start_ms) {
+      // The BMS's last frame arrived before true silence even began - it stopped during the shutdown
+      // announcement itself (C3/C2/C0/00), most likely right when our own frames stopped at 00.
+      unsigned long before_ms = nvrol_silence_start_ms - nvrol_silence_last_rx_ms;
+      snprintf(b, sizeof(b),
+               "Result: BMS's last frame was %lu.%lu s BEFORE the quiet phase began - it was already silent "
+               "during the shutdown announcement (that alone does not prove the pack slept).<br>",
+               before_ms / 1000, (before_ms % 1000) / 100);
+      s += b;
+    } else {
+      unsigned long last_ms = nvrol_silence_last_rx_ms - nvrol_silence_start_ms;
+      unsigned long silence_duration_ms = nvrol_silence_end_ms - nvrol_silence_start_ms;
+      if (last_ms + 3000 < silence_duration_ms) {
+        snprintf(b, sizeof(b), "Result: BMS went silent after %lu.%lu s (measured from when the quiet phase began) - it stopped sending (that alone does not prove the pack slept).<br>",
+                 last_ms / 1000, (last_ms % 1000) / 100);
+      } else {
+        snprintf(b, sizeof(b), "Result: BMS kept sending until the end - it did not go to sleep.<br>");
+      }
+      s += b;
+    }
+  }
+
+  if (wake_tracking) {
+    s += "Wake up: first BMS frame after ";
+    if (wake_first_rx >= 0) {
+      append_secs(s, wake_first_rx);
+    } else {
+      s += "- (none yet)";
+    }
+    s += ", first UDS reply after ";
+    if (wake_first_uds >= 0) {
+      append_secs(s, wake_first_uds);
+    } else {
+      s += "- (none yet)";
+    }
+    s += ", priority values ";
+    if (wake_priority_done >= 0) {
+      s += "complete after ";
+      append_secs(s, wake_priority_done);
+    } else if (wake_priority_timeout) {
+      s += "NOT complete (gave up after 30 s)";
+    } else {
+      s += "pending";
+    }
+    s += "<br>";
+  }
+
+  if (nvrol_silence_id_count > 0) {
+    s += "Frames by CAN ID, earliest silent first (count / data changes / last seen / last data):<br>";
+    s += "Changed bytes of IDs with few changes are shown in [brackets], the last three changes per ID:<br>";
+    uint8_t order[SILENCE_ID_MAX];
+    for (uint8_t i = 0; i < nvrol_silence_id_count; i++) {
+      order[i] = i;
+    }
+    for (uint8_t i = 1; i < nvrol_silence_id_count; i++) {  // insertion sort by last seen, ascending
+      uint8_t v = order[i];
+      int8_t k = i - 1;
+      while (k >= 0 && nvrol_silence_ids[order[k]].last_ms > nvrol_silence_ids[v].last_ms) {
+        order[k + 1] = order[k];
+        k--;
+      }
+      order[k + 1] = v;
+    }
+    for (uint8_t n = 0; n < nvrol_silence_id_count; n++) {
+      const SilenceId& r = nvrol_silence_ids[order[n]];
+      unsigned long t = r.last_ms - powerdown_start_ms;
+      snprintf(b, sizeof(b), "0x%03lX: %lu / %u / T+%lu.%lu s / ", (unsigned long)r.id, (unsigned long)r.count,
+               (unsigned)r.changes, t / 1000, (t % 1000) / 100);
+      s += b;
+      append_hex_bytes(s, r.last, r.dlc > 8 ? 8 : r.dlc);
+      s += "<br>";
+      if (r.changes > 0 && r.changes <= 10) {  // status-like ID: show what changed and when
+        const uint8_t len = r.dlc > 8 ? 8 : r.dlc;
+        for (uint8_t k = 0; k < r.chg_count; k++) {
+          const SilenceChange& ch = r.chg[(r.chg_count < 3) ? k : (uint8_t)((r.chg_next + k) % 3)];
+          snprintf(b, sizeof(b), "&nbsp;&nbsp;change at T+%lu.%lu s: ", (unsigned long)(ch.t_ms / 1000),
+                   (unsigned long)((ch.t_ms % 1000) / 100));
+          s += b;
+          append_hex_marked(s, ch.d, len, ch.mask);
+          s += "<br>";
+        }
+      }
+    }
+    if (nvrol_silence_id_other > 0) {
+      snprintf(b, sizeof(b), "(+ %lu frames of further IDs, table is full)<br>", (unsigned long)nvrol_silence_id_other);
+      s += b;
+    }
+  }
+
+  if (nvrol_silence_reply_total > 0) {
+    snprintf(b, sizeof(b), "Replies on 0x18DAF1DB during the quiet phase: %u<br>", (unsigned)nvrol_silence_reply_total);
+    s += b;
+    for (uint8_t i = 0; i < nvrol_silence_reply_count; i++) {
+      snprintf(b, sizeof(b), "t=%u.%u s: ", (unsigned)(nvrol_silence_reply[i].t_ms / 1000),
+               (unsigned)((nvrol_silence_reply[i].t_ms % 1000) / 100));
+      s += b;
+      append_hex_bytes(s, nvrol_silence_reply[i].d, 8);
+      s += "<br>";
+    }
+  }
+
+  s += "Before the run - BMS state: ";
+  if (nvrol_before.state_valid) {
+    append_hex_bytes(s, nvrol_before.state, 32);
+  } else {
+    s += "not read";
+  }
+  s += "<br>Before the run - balancing in sleep: ";
+  if (nvrol_before.bal_valid[2] && nvrol_before.bal_valid[3]) {
+    s += String(bal_counter_value(nvrol_before.bal_raw[2]), 3);
+    s += " Ah / ";
+    s += String(bal_counter_value(nvrol_before.bal_raw[3]), 3);
+    s += " h";
+  } else {
+    s += "not read";
+  }
+  s += "<br>Before the run - temporisation: ";
+  s += temporisation_text(nvrol_before.temporisation);
+  s += "<br>";
+}
+
+// While a reset is running (and until the priority PIDs have answered afterwards) the box refreshes
+// itself once per second, so the countdown is visible without reloading the page.
+void RenaultTwingoGen1Battery::append_refresh_script_html(String& s, bool busy) {
+  if (!busy) {
+    return;
+  }
+  s += "<script>(function(){function tick(){fetch(location.href,{cache:'no-store'})"
+       ".then(function(r){return r.text();}).then(function(t){"
+       "var d=new DOMParser().parseFromString(t,'text/html');"
+       "var nb=d.getElementById('nvrolBox');var cur=document.getElementById('nvrolBox');"
+       "if(!nb||!cur){return;}cur.innerHTML=nb.innerHTML;"
+       "var a=nb.getAttribute('data-active');cur.setAttribute('data-active',a);"
+       "if(a==='1'){setTimeout(tick,1000);}}).catch(function(){setTimeout(tick,2000);});}"
+       "setTimeout(tick,1000);})();</script>";
+}
 #endif
 
 void RenaultTwingoGen1Battery::handle_incoming_can_frame(CAN_frame rx_frame) {
+#ifdef TWINGO_EXTENDED_CELL_POLLING
+  if (NVROLstateMachine == 5 || NVROLstateMachine == 7) {
+    // Recording runs from the start of the shutdown announcement (state 7: C3/C2/C0/00) all the way
+    // through true silence (state 5), on one continuous timeline - so we can see whether the BMS reacts
+    // at all to the announced C3/C2/C0 states, not just whether it eventually goes quiet.
+    record_silence_frame(rx_frame);
+  } else if (wake_tracking && wake_first_rx < 0) {
+    wake_first_rx = (int32_t)(millis() - wake_start_ms);  // first frame after Wake up
+  }
+#endif
   // UDS frames (0x7BB replies) are handled by the superclass.
   if (handle_incoming_uds_can_frame(rx_frame)) {
     return;
@@ -523,6 +1308,9 @@ void RenaultTwingoGen1Battery::handle_incoming_can_frame(CAN_frame rx_frame) {
       break;
 #ifdef TWINGO_EXTENDED_CELL_POLLING
     case 0x18DAF1DB:  // Extended UDS LBC reply (cell voltages / balancing / lifetime metrics)
+      if (wake_tracking && wake_first_uds < 0 && NVROLstateMachine != 5) {
+        wake_first_uds = (int32_t)(millis() - wake_start_ms);  // first reply after Wake up
+      }
       if (UserRequestNVROLReset) {
         // While the NVROL sequence is running, responses are Session
         // Control/RoutineControl/WriteDataByIdentifier replies, not
@@ -540,7 +1328,33 @@ void RenaultTwingoGen1Battery::handle_incoming_can_frame(CAN_frame rx_frame) {
 }
 
 void RenaultTwingoGen1Battery::transmit_can(unsigned long currentMillis) {
+#ifdef TWINGO_EXTENDED_CELL_POLLING
+  tick_minute_counter();  // free-running 0x350 minute counter; keeps advancing even in true silence
 
+  // NVROL/Sleep sequences: transmit nothing extra of our own (no legacy UDS) while a run is starting or
+  // truly silent. Only the timer runs in true silence; frames from the BMS are still received and counted.
+  if (UserRequestNVROLReset && nvrol_mode == 1 && NVROLstateMachine == 0) {
+    // "Sleep": go straight into the shutdown sequence before anything else can be transmitted.
+    transmit_reset_nvrol_frames();
+  }
+  if (NVROLstateMachine == 5) {
+    // True silence lasts until Wake up is pressed: on purpose the "battery alive" watchdog must not trip.
+    datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
+    transmit_reset_nvrol_frames();
+    return;
+  }
+#endif
+
+#ifdef TWINGO_EXTENDED_CELL_POLLING
+  // During the shutdown sequence's final "00" stage the vehicle has effectively gone silent too - stop our
+  // own broadcast frames here already, not just once true silence (state 5) begins right after.
+  const bool suppress_own_broadcast = (NVROLstateMachine == 7 && powerdown_stage >= 3);
+#else
+  const bool suppress_own_broadcast = false;
+#endif
+  if (suppress_own_broadcast) {
+    datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
+  } else {
   // Send 100ms CAN Message (the BMS only answers diagnostic requests while it
   // receives this wakeup frame)
   if (currentMillis - previousMillis100 >= INTERVAL_100_MS) {
@@ -564,6 +1378,17 @@ void RenaultTwingoGen1Battery::transmit_can(unsigned long currentMillis) {
     transmit_can_frame(&ZOE_426_POWER_MUX);
 
     transmit_can_frame(&ZOE_436_VEHICLE_STATUS);
+
+#ifdef TWINGO_EXTENDED_CELL_POLLING
+    if (NVROLstateMachine == 7) {
+      // Experiment: 0x214 only during the shutdown sequence's C3/C2 stages (see header comment). Stage 0/1
+      // (C3/C2, "announcement active") -> 08 00; stage 2 (C0, "sleeping") -> F8 3E, matching the real log.
+      // Stage 3 (00) is already covered by suppress_own_broadcast further up - not sent there either.
+      TWINGO_214_EVC_SLEEP_REQ.data.u8[0] = (powerdown_stage <= 1) ? 0x08 : 0xF8;
+      TWINGO_214_EVC_SLEEP_REQ.data.u8[1] = (powerdown_stage <= 1) ? 0x00 : 0x3E;
+      transmit_can_frame(&TWINGO_214_EVC_SLEEP_REQ);
+    }
+#endif
   }
 
   // Update EVC 0x436 vehicle runtime clock every 60s
@@ -579,27 +1404,45 @@ void RenaultTwingoGen1Battery::transmit_can(unsigned long currentMillis) {
     previousMillis1000_69f = currentMillis;
     transmit_can_frame(&ZOE_69F_BCM_GATEWAY);
   }
+  }  // !suppress_own_broadcast
 
 #ifdef TWINGO_EXTENDED_CELL_POLLING
   if (UserRequestNVROLReset) {
-    // NVROL reset in progress: run its state machine instead of normal extended
-    // polling, since both share the ZOE_POLL_18DADBF1 frame object below.
+    // NVROL reset / Sleep / shutdown sequence / wake burst in progress: run its state machine instead of
+    // normal extended polling, since both share the ZOE_POLL_18DADBF1 frame object below.
     transmit_reset_nvrol_frames();
   } else {
-  // Extended-address polling: cycle through the 102 poll targets (96 cell
-  // voltages + balancing + 5 lifetime metrics + temporisation), one every
-  // 200ms (same cadence as Battery-Emulator's own Zoe Ph2 driver) -> ~20.4s
-  // per full cycle.
+  // Extended-address polling: cycle through the 115 poll targets (96 cell
+  // voltages + balancing + 4 lifetime metrics + temporisation + 8 pack
+  // temperatures + BMS state + 4 balancing counters), one every 200ms (same
+  // cadence as Battery-Emulator's own Zoe Ph2 driver) -> ~23.0s per full cycle.
+  // Right after the NVROL quiet phase a few PIDs are asked first, see ext_priority_list.
   if (currentMillis - previousMillisExtPoll >= EXT_POLL_INTERVAL_MS) {
     previousMillisExtPoll = currentMillis;
-    uint16_t pid = ext_poll_list[ext_poll_index];
+    uint16_t pid;
+    if (ext_priority_pending_mask != 0 && (currentMillis - ext_priority_start_ms) < EXT_PRIORITY_TIMEOUT_MS) {
+      // After the quiet phase: ask the priority PIDs that have not answered yet, round-robin.
+      uint8_t tries = 0;
+      while (!(ext_priority_pending_mask & (1u << ext_priority_next)) && tries < EXT_PRIORITY_COUNT) {
+        ext_priority_next = (ext_priority_next + 1) % EXT_PRIORITY_COUNT;
+        tries++;
+      }
+      pid = ext_priority_list[ext_priority_next];
+      ext_priority_next = (ext_priority_next + 1) % EXT_PRIORITY_COUNT;
+    } else {
+      if (ext_priority_pending_mask != 0) {
+        wake_priority_timeout = true;  // gave up after 30s
+      }
+      ext_priority_pending_mask = 0;
+      pid = ext_poll_list[ext_poll_index];
+      ext_poll_index = (ext_poll_index + 1) % EXT_POLL_LIST_LENGTH;
+    }
     ZOE_POLL_18DADBF1.data.u8[2] = (uint8_t)((pid >> 8) & 0xFF);
     ZOE_POLL_18DADBF1.data.u8[3] = (uint8_t)(pid & 0xFF);
     transmit_can_frame(&ZOE_POLL_18DADBF1);
 #ifdef EXTENDED_UDS_DEBUG
-    logging.printf("EXT UDS TX: PID=0x%04X (index %u/%u)\n", pid, ext_poll_index, (unsigned)EXT_POLL_LIST_LENGTH);
+    logging.printf("EXT UDS TX: PID=0x%04X\n", pid);
 #endif
-    ext_poll_index = (ext_poll_index + 1) % EXT_POLL_LIST_LENGTH;
   }
 
   // Abandon a stalled multi-frame reassembly rather than let it block forever.
@@ -626,7 +1469,7 @@ inline String& operator<<(String& str, const T& value) {
 
 String RenaultTwingoGen1Battery::get_uds_info_html() {
   String content;
-  content.reserve(400);
+  content.reserve(9000);
 
   // clang-format off
   content << "Cell Under Voltage: " << (LB_CUV >= 2 ? "FAULT" : "OK") << "<br>"
@@ -638,20 +1481,34 @@ String RenaultTwingoGen1Battery::get_uds_info_html() {
              "Isolation: " << (LB_HVBIR >= 2 ? "FAULT" : "OK") << "<br>"
              "End Of Charge: " << (LB_EOCR >= 2 ? "YES" : "NO") << "<br>"
              "Battery Mileage: " << battery_mileage_in_km << " km<br>"
-             "Lifetime Energy: " << kWh_from_beginning_of_battery_life << " kWh<br>"
+             "Lifetime Energy: " << kWh_from_beginning_of_battery_life << " kWh<br>";
+  // clang-format on
+
 #ifdef TWINGO_EXTENDED_CELL_POLLING
+  // Everything below sits in one box that refreshes itself while an NVROL reset is running (countdown of
+  // the quiet phase) and until the priority PIDs have answered afterwards.
+  const bool nvrol_busy = UserRequestNVROLReset || (ext_priority_pending_mask != 0);
+  // clang-format off
+  content << "<div id='nvrolBox' data-active='" << (nvrol_busy ? "1" : "0") << "'>"
              "Charge Cycles: " << battery_charge_cycles << "<br>"
              "Energy Charged: " << battery_energy_charged_kWh << " kWh<br>"
              "Energy Discharged: " << battery_energy_discharged_kWh << " kWh<br>"
              "Energy Regenerated: " << battery_energy_regenerated_kWh << " kWh<br>"
-             "Temporisation: " << (battery_temporisation == 255 ? "not yet read" : (battery_temporisation ? "1" : "0")) << "<br>"
-             "NVROL Log - Session1: " << nvrol_log[0] << "<br>"
+             "Temporisation (0x9281): " << temporisation_text(battery_temporisation) << "<br>";
+  // clang-format on
+  append_live_html(content);
+  // clang-format off
+  content << "NVROL Log - Session1: " << nvrol_log[0] << "<br>"
              "NVROL Log - Routine B009: " << nvrol_log[1] << "<br>"
              "NVROL Log - Session2: " << nvrol_log[2] << "<br>"
              "NVROL Log - Write 9281=1: " << nvrol_log[3] << "<br>"
-#endif
-             ;
+             "NVROL Log - Read back 0x9281: " << nvrol_log[4] << "<br>"
+             "Temporisation right after the write (read back): " << temporisation_text(temporisation_readback) << "<br>";
   // clang-format on
+  append_quiet_html(content);
+  content << "</div>";
+  append_refresh_script_html(content, nvrol_busy);
+#endif
 
   return content;
 }
@@ -680,6 +1537,10 @@ void RenaultTwingoGen1Battery::setup(void) {  // Performs one time setup at star
   datalayer_battery->info.max_cell_voltage_mV = MAX_CELL_VOLTAGE_MV;
   datalayer_battery->info.min_cell_voltage_mV = MIN_CELL_VOLTAGE_MV;
   datalayer_battery->info.max_cell_voltage_deviation_mV = MAX_CELL_DEVIATION_MV;
+#ifdef TWINGO_EXTENDED_CELL_POLLING
+  // This battery provides 8 single pack temperature sensors (shown on the Cellmonitor page).
+  datalayer_battery->status.temperature_sensors_count = EXT_TEMP_SENSOR_COUNT;
+#endif
 }
 
 static const uint16_t ZOE_STATE_OPEN_SESSION = 1;

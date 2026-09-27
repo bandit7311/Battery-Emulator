@@ -98,6 +98,7 @@ class Battery {
   virtual bool supports_reset_SOC() { return false; }
   virtual bool supports_reset_crash() { return false; }
   virtual bool supports_reset_NVROL() { return false; }
+  virtual bool supports_sleep_control() { return false; }
   virtual bool supports_reset_DTC() { return false; }
   virtual bool supports_read_DTC() { return false; }
   virtual bool supports_reset_SOH() { return false; }
@@ -129,6 +130,9 @@ class Battery {
   virtual void reset_crash() {}
   virtual void reset_contactor() {}
   virtual void reset_NVROL() {}
+  virtual void request_sleep() {}
+  virtual void request_sleep_temporisation() {}
+  virtual void request_wake_up() {}
   virtual void reset_DTC() {}
   virtual void read_DTC() {}
   virtual void reset_SOH() {}

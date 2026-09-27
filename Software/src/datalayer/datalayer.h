@@ -117,6 +117,13 @@ struct DATALAYER_BATTERY_STATUS_TYPE {
   int16_t temperature_max_dC;
   /** Minimum temperature currently measured in the pack, in d°C. 150 = 15.0 °C */
   int16_t temperature_min_dC;
+  /** Individual temperature sensor readings in d°C. 150 = 15.0 °C. Only for batteries that report single sensors.
+   * temperature_sensors_count: how many sensors the battery provides (0 = not supported, nothing is shown).
+   * temperature_sensors_valid_mask: bit n is set while sensor n holds a plausible, fresh value.
+   */
+  int16_t temperature_sensors_dC[8] = {0};
+  uint8_t temperature_sensors_count = 0;
+  uint8_t temperature_sensors_valid_mask = 0;
   /** Instantaneous battery current in deciAmpere. 95 = 9.5 A */
   int16_t current_dA = 0;
   /** Instantaneous battery current in deciAmpere. Sum of all batteries in the system 95 = 9.5 A */

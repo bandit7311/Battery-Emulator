@@ -61,6 +61,10 @@ String cellmonitor_processor(const String& var) {
     content += "<div id='cellContainer' class='container'></div>";
     // Display bars
     content += "<div id='graph'></div>";
+    // Single pack temperature sensors (only for batteries that report them), aligned under the bars
+    if (datalayer.battery.status.temperature_sensors_count > 0) {
+      content += "<div id='tempRow'></div>";
+    }
     // Display single hovered value
     content += "<div id='valueDisplay'>Value: ...</div>";
     //Legend for graph
@@ -192,6 +196,20 @@ String cellmonitor_processor(const String& var) {
     }
     content += "];";
 
+    // Single pack temperature sensors in d°C, null = sensor has no valid value right now
+    if (datalayer.battery.status.temperature_sensors_count > 0) {
+      content += "const temps = [";
+      for (uint8_t i = 0u; i < datalayer.battery.status.temperature_sensors_count && i < 8u; i++) {
+        if (datalayer.battery.status.temperature_sensors_valid_mask & (1u << i)) {
+          content += String(datalayer.battery.status.temperature_sensors_dC[i]) + ",";
+        } else {
+          content += "null,";
+        }
+      }
+      content += "];";
+      content += "const numberOfCells = " + String(datalayer.battery.info.number_of_cells) + ";";
+    }
+
     content += "const min_mv = Math.min(...data) - 20;";
     content += "const max_mv = Math.max(...data) + 20;";
     content += "const min_index = data.indexOf(Math.min(...data));";
@@ -280,6 +298,51 @@ String cellmonitor_processor(const String& var) {
         "});"
         "}";
 
+    // Temperature row: one box per group of cells, placed exactly under the bars of that group
+    // (measured from the real bar positions, so it also lines up when the bars get squeezed).
+    // Only shown once every cell has a value, otherwise the bar index would not match the cell number.
+    if (datalayer.battery.status.temperature_sensors_count > 0) {
+      content +=
+          "function layoutTempRow() {"
+          "const row = document.getElementById('tempRow');"
+          "const per = numberOfCells / temps.length;"
+          "row.innerHTML = '';"
+          "row.style.cssText = 'position:relative;height:40px;margin-top:4px;';"
+          "document.querySelectorAll('.tempSep').forEach(e => e.remove());"
+          "temps.forEach((t, g) => {"
+          "const first = document.getElementById('barIndex' + (g * per));"
+          "const last = document.getElementById('barIndex' + ((g + 1) * per - 1));"
+          "if (!first || !last) { return; }"
+          "const left = first.offsetLeft;"
+          "const width = last.offsetLeft + last.offsetWidth - left;"
+          "if (g > 0) {"
+          "const sep = document.createElement('div');"
+          "sep.className = 'tempSep';"
+          "sep.style.cssText = 'position:absolute;top:0;bottom:0;width:0;border-left:1px dashed "
+          "rgba(255,255,255,0.35);pointer-events:none;left:' + left + 'px;';"
+          "graphContainer.appendChild(sep);"
+          "}"
+          "const box = document.createElement('div');"
+          "box.style.cssText = 'position:absolute;top:0;bottom:0;box-sizing:border-box;border:1px solid "
+          "rgba(255,255,255,0.55);border-radius:4px;text-align:center;padding:2px 0;line-height:1.25;"
+          "overflow:hidden;left:' + (left + graphContainer.clientLeft + 1) + 'px;width:' + (width - 2) + 'px;';"
+          "const range = (g * per + 1) + '\\u2013' + ((g + 1) * per);"
+          "box.title = 'Sensor ' + (g + 1) + ', cells ' + range;"
+          "const value = (t === null) ? '--' : (t / 10).toFixed(1) + ' \\u00b0C';"
+          "box.innerHTML = '<div style=\"font-size:11px;color:#9fb0bb;white-space:nowrap;overflow:hidden;"
+          "text-overflow:ellipsis;\">T' + (g + 1) + ' \\u00b7 Z' + range + '</div>'"
+          " + '<div style=\"font-size:12px;font-weight:bold;\">' + value + '</div>';"
+          "row.appendChild(box);"
+          "});"
+          "}"
+          "function createTempRow() {"
+          "if (!document.getElementById('tempRow') || temps.length == 0 || data.length != numberOfCells || "
+          "numberOfCells % temps.length != 0) { return; }"
+          "layoutTempRow();"
+          "window.addEventListener('resize', layoutTempRow);"
+          "}";
+    }
+
     // On fetch, update the header of max/min/deviation client-side for consistency
     content +=
         "function updateVoltageValues(data) {"
@@ -298,6 +361,9 @@ String cellmonitor_processor(const String& var) {
     content += "if (data.length != 0) {";
     content += "createCells(data);";
     content += "createBars(data);";
+    if (datalayer.battery.status.temperature_sensors_count > 0) {
+      content += "createTempRow();";
+    }
     content += "updateVoltageValues(data);";
     content += "}";
     content += "else {";

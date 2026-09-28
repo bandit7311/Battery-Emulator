@@ -1,8 +1,13 @@
 #include "RENAULT-TWINGO-GEN1-BATTERY.h"
 #include "../datalayer/datalayer.h"
+#include "../devboard/utils/common_functions.h"  // crc8_table_SAE_J1850_ZER0
 #include "../devboard/utils/events.h"
 #include "../devboard/utils/logging.h"
 #include "../devboard/webserver/BatteryHtmlRenderer.h"
+#ifndef UNIT_TEST
+#include <WiFi.h>  // WiFi.status() for the NTP start
+#endif
+#include <time.h>
 
 /* Information in this file is based of the OVMS V3 vehicle_renaultzoe.cpp component 
 https://github.com/openvehicles/Open-Vehicle-Monitoring-System-3/blob/master/vehicle/OVMS.V3/components/vehicle_renaultzoe/src/vehicle_renaultzoe.cpp
@@ -230,6 +235,19 @@ void RenaultTwingoGen1Battery::handle_extended_single_frame(uint16_t pid, const 
   }
 
   switch (pid) {
+    case EXT_POLL_TIME:  // 0x9261 and 0x91C1: shown raw, up to 4 data bytes of a single-frame reply
+    case EXT_POLL_PACK_TIME:
+      if (length >= 1) {
+        uint8_t idx = (pid == EXT_POLL_PACK_TIME) ? 1 : 0;
+        uint8_t n = (length > 4) ? 4 : (uint8_t)length;
+        uint32_t v = 0;
+        for (uint8_t i = 0; i < n; i++) {
+          v = (v << 8) | data[i];
+        }
+        time_pid_raw[idx] = v;
+        time_pid_len[idx] = n;
+      }
+      break;
     case EXT_POLL_CYCLES:  // 0x9210, 16-bit count, no scaling
       if (length >= 2) {
         battery_charge_cycles = (data[0] << 8) | data[1];
@@ -728,6 +746,10 @@ void RenaultTwingoGen1Battery::finish_nvrol_silence(void) {
   battery_temporisation = 0x100;
   ext_filter_rearm_active = true;
   ext_filter_rearm_start_ms = millis();
+  temp_boot_filter_active = true;  // the temperature filter of 0x424 is armed again like the cell filter
+  temp_boot_first_frame_ms = 0;
+  time_pid_len[0] = 0;  // show the time PIDs as "not yet read" until they have been polled again
+  time_pid_len[1] = 0;
   ext_isotp_in_progress = false;
   ext_poll_index = 0;
   ext_priority_pending_mask = 0x0F;
@@ -736,21 +758,6 @@ void RenaultTwingoGen1Battery::finish_nvrol_silence(void) {
   previousMillisExtPoll = millis();  // first poll after the restart follows 200ms later
   UserRequestNVROLReset = false;
   NVROLstateMachine = 0;
-}
-
-// Free-running minute counter for byte 3 of 0x350 (matches the real vehicle's own counter, see
-// Log_Twingo_Ladung.log) - ticks every 60s regardless of state, including through true silence, so it
-// stays correct once transmission resumes. Costs nothing when nothing is sent.
-void RenaultTwingoGen1Battery::tick_minute_counter(void) {
-  unsigned long now = millis();
-  if (vehicle_minute_counter_last_ms == 0) {
-    vehicle_minute_counter_last_ms = now;
-    return;
-  }
-  while (now - vehicle_minute_counter_last_ms >= 60000UL) {
-    vehicle_minute_counter_last_ms += 60000UL;
-    vehicle_minute_counter++;
-  }
 }
 
 // One 0x350 frame for the shutdown sequence (case 7): bytes 5/6/7 depend only on whether the state is the
@@ -768,7 +775,7 @@ void RenaultTwingoGen1Battery::send_vehicle_state_350(uint8_t byte0) {
                  .ext_ID = false,
                  .DLC = 8,
                  .ID = 0x350,
-                 .data = {byte0, 0x26, 0x64, vehicle_minute_counter, 0x14, b5, 0x96, b7}};
+                 .data = {byte0, VEHICLE_AGE_350_B1, VEHICLE_AGE_350_B2, VEHICLE_AGE_350_B3, 0x14, b5, 0x96, b7}};
   transmit_can_frame(&f);
 }
 
@@ -797,7 +804,7 @@ void RenaultTwingoGen1Battery::send_wake_burst_frame(uint8_t index) {
                  .ext_ID = false,
                  .DLC = 8,
                  .ID = 0x350,
-                 .data = {byte0, 0x26, 0x64, vehicle_minute_counter, 0x14, b5, 0x96, b7}};
+                 .data = {byte0, VEHICLE_AGE_350_B1, VEHICLE_AGE_350_B2, VEHICLE_AGE_350_B3, 0x14, b5, 0x96, b7}};
   transmit_can_frame(&f);
 }
 
@@ -880,6 +887,29 @@ void RenaultTwingoGen1Battery::append_live_html(String& s) {
     s += b;
     s += ")<br>";
   }
+  for (uint8_t idx = 0; idx < 2; idx++) {
+    s += (idx == 0) ? "Time (0x9261): " : "Pack time (0x91C1): ";
+    if (time_pid_len[idx] == 0) {
+      s += "not yet read<br>";
+      continue;
+    }
+    char b[24];
+    snprintf(b, sizeof(b), "%0*lX", (int)(time_pid_len[idx] * 2), (unsigned long)time_pid_raw[idx]);
+    s += b;
+    s += " (";
+    s += String((unsigned long)time_pid_raw[idx]);
+    s += ")<br>";
+  }
+  s += "SOH candidate (0x658 byte 4): ";
+  if (soh_658 == 0xFF) {
+    s += "not received";
+  } else if (soh_658 == 0x7F) {
+    s += "invalid (127)";
+  } else {
+    s += String(soh_658);
+    s += " %";
+  }
+  s += "<br>";
 }
 
 void RenaultTwingoGen1Battery::priority_answered(uint8_t bit) {
@@ -1284,9 +1314,32 @@ void RenaultTwingoGen1Battery::handle_incoming_can_frame(CAN_frame rx_frame) {
       LB_COV = (rx_frame.data.u8[1] & 0xC0) >> 6;
       LB_Regen_allowed_W = rx_frame.data.u8[2] * 500;
       LB_Discharge_allowed_W = rx_frame.data.u8[3] * 500;
-      LB_Cell_minimum_temperature = (rx_frame.data.u8[4] - 40);
       LB_SOH = rx_frame.data.u8[5];
-      LB_Cell_maximum_temperature = (rx_frame.data.u8[7] - 40);
+      {
+        // Boot plausibility filter for the temperatures (see the comment in the header): while it is active
+        // only -20..+60 degC are accepted, it ends with the first plausible frame or 60 s after the first
+        // 0x424 frame; from then on every value is taken over unfiltered.
+        int16_t t_min = (int16_t)rx_frame.data.u8[4] - 40;
+        int16_t t_max = (int16_t)rx_frame.data.u8[7] - 40;
+        bool accept_temperatures = true;
+        if (temp_boot_filter_active) {
+          unsigned long now = millis();
+          if (temp_boot_first_frame_ms == 0) {
+            temp_boot_first_frame_ms = (now != 0) ? now : 1;  // 0 is reserved for "no frame yet"
+          }
+          bool plausible = (t_min >= TEMP_BOOT_MIN_C && t_min <= TEMP_BOOT_MAX_C && t_max >= TEMP_BOOT_MIN_C &&
+                            t_max <= TEMP_BOOT_MAX_C);
+          if (plausible || (now - temp_boot_first_frame_ms) >= TEMP_BOOT_FILTER_TIMEOUT_MS) {
+            temp_boot_filter_active = false;
+          } else {
+            accept_temperatures = false;
+          }
+        }
+        if (accept_temperatures) {
+          LB_Cell_minimum_temperature = t_min;
+          LB_Cell_maximum_temperature = t_max;
+        }
+      }
       break;
     case 0x425:  //100ms Cellvoltages and kWh remaining - Confirmed sent by: Fluence ZE40 & Zoe Gen1
       LB_Cell_maximum_voltage = (((((rx_frame.data.u8[4] & 0x03) << 7) | (rx_frame.data.u8[5] >> 1)) * 10) + 1000);
@@ -1305,6 +1358,11 @@ void RenaultTwingoGen1Battery::handle_incoming_can_frame(CAN_frame rx_frame) {
       break;
     case 0x654:  //SOC
       LB_SOC = rx_frame.data.u8[3];
+      break;
+    case 0x658:  // SOH candidate (OVMS: byte 4 & 0x7F, 127 = invalid) - display only, not used for anything else
+      if (rx_frame.DLC >= 5) {
+        soh_658 = rx_frame.data.u8[4] & 0x7F;
+      }
       break;
 #ifdef TWINGO_EXTENDED_CELL_POLLING
     case 0x18DAF1DB:  // Extended UDS LBC reply (cell voltages / balancing / lifetime metrics)
@@ -1327,10 +1385,129 @@ void RenaultTwingoGen1Battery::handle_incoming_can_frame(CAN_frame rx_frame) {
   }
 }
 
-void RenaultTwingoGen1Battery::transmit_can(unsigned long currentMillis) {
-#ifdef TWINGO_EXTENDED_CELL_POLLING
-  tick_minute_counter();  // free-running 0x350 minute counter; keeps advancing even in true silence
+#ifdef TWINGO_TIME_FRAMES
+// ---------------------------------------------------------------------------
+// Time frames (see the define at the top of the header). The three hooks below are the only places that
+// touch WiFi / NTP / the system clock, the unit tests replace them.
+// ---------------------------------------------------------------------------
+bool RenaultTwingoGen1Battery::network_ready() {
+#ifndef UNIT_TEST
+  return WiFi.status() == WL_CONNECTED;
+#else
+  return false;
+#endif
+}
 
+// Same call and servers as the Dala display firmware: German local time with daylight saving. It only sets the
+// time zone and starts the SNTP client, which then keeps synchronising by itself.
+void RenaultTwingoGen1Battery::start_ntp() {
+#ifndef UNIT_TEST
+  configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
+#endif
+}
+
+bool RenaultTwingoGen1Battery::get_wall_clock_seconds_of_day(uint32_t& secs) {
+  time_t now = time(nullptr);
+  if (now < TIME_VALID_AFTER) {
+    return false;  // not set yet (the ESP32 starts at 1970)
+  }
+  struct tm t;
+  localtime_r(&now, &t);
+  secs = (uint32_t)t.tm_hour * 3600UL + (uint32_t)t.tm_min * 60UL + (uint32_t)t.tm_sec;
+  return true;
+}
+
+// Once per second: remember when the fallback clock started and, as soon as the WiFi station is connected, start
+// NTP once (also when the WiFi only comes up after the boot).
+void RenaultTwingoGen1Battery::time_service(unsigned long currentMillis) {
+  if (!time_fallback_started) {
+    time_fallback_started = true;
+    time_fallback_start_ms = currentMillis;
+  }
+  if (currentMillis - previousMillis_time_service < INTERVAL_1_S) {
+    return;
+  }
+  previousMillis_time_service = currentMillis;
+  if (!ntp_started && network_ready()) {
+    start_ntp();
+    ntp_started = true;
+  }
+}
+
+// 0x53B, called once per second from the own-broadcast block of transmit_can(). That block is skipped in
+// true silence and from the "00" stage of the shutdown sequence on, so 0x53B stops with the other own frames.
+void RenaultTwingoGen1Battery::send_time_frames(unsigned long currentMillis) {
+  uint32_t secs = 0;
+  if (!get_wall_clock_seconds_of_day(secs)) {
+    secs = (TIME_FALLBACK_START_S + (uint32_t)((currentMillis - time_fallback_start_ms) / 1000UL)) % 86400UL;
+  }
+  TWINGO_53B_CLOCK.data.u8[0] = (uint8_t)((secs / 3600UL) << 3);
+  TWINGO_53B_CLOCK.data.u8[1] = (uint8_t)(((secs / 60UL) % 60UL) << 2);
+  TWINGO_53B_CLOCK.data.u8[2] = TIME_53B_BYTE2;
+  TWINGO_53B_CLOCK.data.u8[3] = (uint8_t)((TIME_53B_YEAR_BITS << 6) | (secs % 60UL));
+  TWINGO_53B_CLOCK.data.u8[4] = (uint8_t)(TIME_53B_MONTH << 4);
+  TWINGO_53B_CLOCK.data.u8[5] = (uint8_t)((TIME_53B_DAY << 3) | TIME_53B_WEEKDAY);
+  transmit_can_frame(&TWINGO_53B_CLOCK);
+}
+
+// The 0x350 run frame (state C3, every 100 ms like in the vehicle), called from the 100 ms block of
+// transmit_can(). During the shutdown sequence and the wake burst those send their own 0x350.
+void RenaultTwingoGen1Battery::send_run_350() {
+#ifdef TWINGO_EXTENDED_CELL_POLLING
+  if (NVROLstateMachine == 7 || NVROLstateMachine == 8) {
+    return;
+  }
+#endif
+  transmit_can_frame(&TWINGO_350_RUN);
+}
+#endif  // TWINGO_TIME_FRAMES
+
+#ifdef TWINGO_FAST_VEHICLE_FRAMES
+// CRC-8 with poly 0x1D and start value 0 (same table as the Zoe Ph2 driver), final XOR per frame.
+static uint8_t twingo_crc8(const uint8_t* d, uint8_t n, uint8_t xor_out) {
+  uint8_t crc = 0;
+  for (uint8_t i = 0; i < n; i++) {
+    crc = crc8_table_SAE_J1850_ZER0[(crc ^ d[i]) & 0xFF];
+  }
+  return (uint8_t)(crc ^ xor_out);
+}
+
+// 0x090 (10 ms) and 0x242 (20 ms) like in the vehicle: they only run while it is awake. In the vehicle log they
+// start with the first C3 frame after a wake-up and stop as soon as 0x350 goes to C0. Called every loop from the
+// own-broadcast block, so they are also off in true silence and from the "00" stage on.
+void RenaultTwingoGen1Battery::send_fast_frames(unsigned long currentMillis) {
+#ifdef TWINGO_EXTENDED_CELL_POLLING
+  if (NVROLstateMachine == 7 && powerdown_stage >= 2) {
+    return;  // C0 and 00 stage of the shutdown sequence
+  }
+  if (NVROLstateMachine == 8 && wake_burst_index == 0) {
+    return;  // wake burst: the initial C0 frame has not been sent yet
+  }
+#endif
+  if (currentMillis - previousMillis_090 >= INTERVAL_10_MS) {
+    previousMillis_090 = currentMillis;
+    fast_090_counter = (uint8_t)((fast_090_counter + 1) & 0x0F);
+    TWINGO_090_FAST.data.u8[2] = (uint8_t)(0xE0 | fast_090_counter);
+    const uint8_t crc_in[6] = {TWINGO_090_FAST.data.u8[0], TWINGO_090_FAST.data.u8[1], TWINGO_090_FAST.data.u8[2],
+                               TWINGO_090_FAST.data.u8[4], TWINGO_090_FAST.data.u8[5], TWINGO_090_FAST.data.u8[6]};
+    TWINGO_090_FAST.data.u8[3] = twingo_crc8(crc_in, 6, CRC_XOR_090);
+    transmit_can_frame(&TWINGO_090_FAST);
+  }
+  if (currentMillis - previousMillis_242 >= INTERVAL_20_MS) {
+    previousMillis_242 = currentMillis;
+    fast_242_counter = (uint8_t)((fast_242_counter + 1) & 0x0F);
+    TWINGO_242_FAST.data.u8[1] = (uint8_t)(fast_242_counter << 3);
+    TWINGO_242_FAST.data.u8[7] = twingo_crc8(TWINGO_242_FAST.data.u8, 7, CRC_XOR_242);
+    transmit_can_frame(&TWINGO_242_FAST);
+  }
+}
+#endif  // TWINGO_FAST_VEHICLE_FRAMES
+
+void RenaultTwingoGen1Battery::transmit_can(unsigned long currentMillis) {
+#ifdef TWINGO_TIME_FRAMES
+  time_service(currentMillis);  // NTP start / fallback clock, transmits nothing itself
+#endif
+#ifdef TWINGO_EXTENDED_CELL_POLLING
   // NVROL/Sleep sequences: transmit nothing extra of our own (no legacy UDS) while a run is starting or
   // truly silent. Only the timer runs in true silence; frames from the BMS are still received and counted.
   if (UserRequestNVROLReset && nvrol_mode == 1 && NVROLstateMachine == 0) {
@@ -1379,6 +1556,10 @@ void RenaultTwingoGen1Battery::transmit_can(unsigned long currentMillis) {
 
     transmit_can_frame(&ZOE_436_VEHICLE_STATUS);
 
+#ifdef TWINGO_TIME_FRAMES
+    send_run_350();  // 0x350 vehicle state C3, every 100 ms
+#endif
+
 #ifdef TWINGO_EXTENDED_CELL_POLLING
     if (NVROLstateMachine == 7) {
       // Experiment: 0x214 only during the shutdown sequence's C3/C2 stages (see header comment). Stage 0/1
@@ -1403,7 +1584,14 @@ void RenaultTwingoGen1Battery::transmit_can(unsigned long currentMillis) {
   if (currentMillis - previousMillis1000_69f >= INTERVAL_1_S) {
     previousMillis1000_69f = currentMillis;
     transmit_can_frame(&ZOE_69F_BCM_GATEWAY);
+#ifdef TWINGO_TIME_FRAMES
+    send_time_frames(currentMillis);  // 0x53B clock, same 1 Hz cycle
+#endif
   }
+
+#ifdef TWINGO_FAST_VEHICLE_FRAMES
+  send_fast_frames(currentMillis);  // 0x090 every 10 ms, 0x242 every 20 ms
+#endif
   }  // !suppress_own_broadcast
 
 #ifdef TWINGO_EXTENDED_CELL_POLLING
@@ -1412,10 +1600,10 @@ void RenaultTwingoGen1Battery::transmit_can(unsigned long currentMillis) {
     // normal extended polling, since both share the ZOE_POLL_18DADBF1 frame object below.
     transmit_reset_nvrol_frames();
   } else {
-  // Extended-address polling: cycle through the 115 poll targets (96 cell
+  // Extended-address polling: cycle through the 119 poll targets (96 cell
   // voltages + balancing + 4 lifetime metrics + temporisation + 8 pack
-  // temperatures + BMS state + 4 balancing counters), one every 200ms (same
-  // cadence as Battery-Emulator's own Zoe Ph2 driver) -> ~23.0s per full cycle.
+  // temperatures + BMS state + 6 balancing counters + 2 time PIDs), one every 200ms (same
+  // cadence as Battery-Emulator's own Zoe Ph2 driver) -> ~23.8s per full cycle.
   // Right after the NVROL quiet phase a few PIDs are asked first, see ext_priority_list.
   if (currentMillis - previousMillisExtPoll >= EXT_POLL_INTERVAL_MS) {
     previousMillisExtPoll = currentMillis;

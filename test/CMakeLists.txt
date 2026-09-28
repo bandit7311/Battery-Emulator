@@ -145,6 +145,7 @@ add_executable(tests
     ../Software/src/battery/RANGE-ROVER-PHEV-BATTERY.cpp
     ../Software/src/battery/RELION-LV-BATTERY.cpp
     ../Software/src/battery/RENAULT-KANGOO-BATTERY.cpp
+    ../Software/src/battery/RENAULT-TWINGO-GEN1-BATTERY.cpp
     ../Software/src/battery/RENAULT-TWIZY.cpp
     ../Software/src/battery/RENAULT-ZOE-GEN1-BATTERY.cpp
     ../Software/src/battery/RENAULT-ZOE-GEN2-BATTERY.cpp

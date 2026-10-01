@@ -227,6 +227,16 @@ struct DATALAYER_INFO_TWINGO_GEN1 {
    *  after this many minutes of true silence if "Wake up" is never pressed). Settable on "More Battery
    *  Info", persisted to NVM. Clamped to 1-1440 by the driver if out of range. */
   uint16_t sleep_failsafe_minutes;
+
+  /** Cellwatch: fast single-cell poll diagnostic (see RENAULT-TWINGO-GEN1-BATTERY.cpp /cellwatch page).
+   *  Runtime only, NOT persisted to NVM - always starts disabled after a reboot, so it can never be
+   *  left running unattended across a power cycle. While enabled, the normal 135-PID extended
+   *  round-robin poll is fully paused and only cellwatch_cell's voltage PID is requested, back-to-back. */
+  bool cellwatch_enabled;
+  uint8_t cellwatch_cell;             // 1-96, which cell to watch
+  uint16_t cellwatch_last_mV;         // last value received for cellwatch_cell
+  uint32_t cellwatch_sample_count;    // successful samples since cellwatch was last turned on
+  uint32_t cellwatch_last_sample_ms;  // millis() of the last received sample (0 = none yet)
 };
 
 struct DATALAYER_INFO_CELLPOWER {
@@ -1073,6 +1083,7 @@ class DataLayerExtended {
     // nvrol_temporisation_write_value = 0 and nvrol_b009_use_programming_session = false are already
     // correct via the memset(0) above; only the non-zero default needs setting here.
     twingoGen1.sleep_failsafe_minutes = 30;
+    twingoGen1.cellwatch_cell = 1;
   }
 };
 

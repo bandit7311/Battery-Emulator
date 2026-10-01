@@ -400,6 +400,13 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   unsigned long previousMillisExtPoll = 0;
   static const unsigned long EXT_POLL_INTERVAL_MS = 200;  // Matches Zoe Ph2 driver's proven cadence
 
+  // Cellwatch (see datalayer_extended.twingoGen1.cellwatch_*): own timer, independent of
+  // previousMillisExtPoll, so the round-robin's position/phase is left untouched while paused.
+  // 50ms is an unverified starting guess, not a measured minimum round-trip for this BMS - shorten
+  // or lengthen once real behavior is observed.
+  unsigned long previousMillisCellwatch = 0;
+  static const unsigned long CELLWATCH_MIN_GAP_MS = 50;
+
   // Generic ISO-TP multi-frame reassembly buffer for the extended channel.
   // Only ever needed for EXT_POLL_BALANCE_SWITCHES (96 bit doesn't fit a
   // single frame); everything else here is single-frame.

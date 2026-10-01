@@ -229,6 +229,12 @@ void RenaultTwingoGen1Battery::handle_extended_single_frame(uint16_t pid, const 
       ext_cells_seen++;
     }
     datalayer_battery->status.cell_voltages_mV[cell_index] = cell_mV;
+    if (datalayer_extended.twingoGen1.cellwatch_enabled &&
+        (cell_index + 1) == datalayer_extended.twingoGen1.cellwatch_cell) {
+      datalayer_extended.twingoGen1.cellwatch_last_mV = cell_mV;
+      datalayer_extended.twingoGen1.cellwatch_sample_count++;
+      datalayer_extended.twingoGen1.cellwatch_last_sample_ms = (uint32_t)now;
+    }
     return;
   }
 
@@ -1776,7 +1782,29 @@ void RenaultTwingoGen1Battery::transmit_can(unsigned long currentMillis) {
   // temperatures + BMS state + 6 balancing counters + 2 time PIDs), one every 200ms (same
   // cadence as Battery-Emulator's own Zoe Ph2 driver) -> ~23.8s per full cycle.
   // Right after the NVROL quiet phase a few PIDs are asked first, see ext_priority_list.
-  if (currentMillis - previousMillisExtPoll >= EXT_POLL_INTERVAL_MS) {
+  if (datalayer_extended.twingoGen1.cellwatch_enabled) {
+    // Cellwatch active: the normal round-robin is fully paused - previousMillisExtPoll/ext_poll_index
+    // are simply never touched here, so it resumes from exactly where it left off once Cellwatch is
+    // turned off again (Variante 1: pausieren, nicht verzahnen). Only the selected cell is requested,
+    // back-to-back, limited only by CELLWATCH_MIN_GAP_MS.
+    if (currentMillis - previousMillisCellwatch >= CELLWATCH_MIN_GAP_MS) {
+      previousMillisCellwatch = currentMillis;
+      uint8_t cell = datalayer_extended.twingoGen1.cellwatch_cell;
+      if (cell < 1) {
+        cell = 1;
+      }
+      if (cell > 96) {
+        cell = 96;
+      }
+      uint16_t pid = ext_poll_list[cell - 1];  // cell 1..96 -> the first 96 entries, in order
+      ZOE_POLL_18DADBF1.data.u8[2] = (uint8_t)((pid >> 8) & 0xFF);
+      ZOE_POLL_18DADBF1.data.u8[3] = (uint8_t)(pid & 0xFF);
+      transmit_can_frame(&ZOE_POLL_18DADBF1);
+#ifdef EXTENDED_UDS_DEBUG
+      logging.printf("EXT UDS TX (cellwatch): PID=0x%04X\n", pid);
+#endif
+    }
+  } else if (currentMillis - previousMillisExtPoll >= EXT_POLL_INTERVAL_MS) {
     previousMillisExtPoll = currentMillis;
     uint16_t pid;
     if (ext_priority_pending_mask != 0 && (currentMillis - ext_priority_start_ms) < EXT_PRIORITY_TIMEOUT_MS) {
@@ -1883,6 +1911,16 @@ String RenaultTwingoGen1Battery::get_uds_info_html() {
     content += String(datalayer_extended.twingoGen1.sleep_failsafe_minutes);
     content += "'> min <button onclick='twingoSetSleepMinutes()'>Set</button></h4>";
 
+    content += "<h4>Cellwatch (fast single-cell poll): "
+               "<input type='checkbox' id='twingoCellwatchEnable' onclick='twingoSetCellwatchEnable(this.checked)' ";
+    content += datalayer_extended.twingoGen1.cellwatch_enabled ? "checked>" : ">";
+    content += " enable, cell <input type='number' id='twingoCellwatchCell' min='1' max='96' value='";
+    content += String(datalayer_extended.twingoGen1.cellwatch_cell);
+    content +=
+        "'> <button onclick='twingoSetCellwatchCell()'>Set</button> "
+        "<button onclick=\"window.open('/cellwatch','_blank')\">Open Cellwatch page</button>"
+        " - pauses the normal cell round-robin while enabled</h4>";
+
     content += "<script>";
     content += "function twingoSetWriteValue(v){";
     content += "document.getElementById('twingoWrite00').checked=(v===0);";
@@ -1895,6 +1933,11 @@ String RenaultTwingoGen1Battery::get_uds_info_html() {
     content += "function twingoSetSleepMinutes(){";
     content += "var m=document.getElementById('twingoSleepMinutes').value;";
     content += "var x=new XMLHttpRequest();x.open('GET','/editTwingoSleepMinutes?value='+m,true);x.send();}";
+    content += "function twingoSetCellwatchEnable(v){";
+    content += "var x=new XMLHttpRequest();x.open('GET','/editTwingoCellwatchEnable?value='+(v?1:0),true);x.send();}";
+    content += "function twingoSetCellwatchCell(){";
+    content += "var c=document.getElementById('twingoCellwatchCell').value;";
+    content += "var x=new XMLHttpRequest();x.open('GET','/editTwingoCellwatchCell?value='+c,true);x.send();}";
     content += "</script>";
   }
 

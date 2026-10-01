@@ -44,6 +44,7 @@ AsyncAuthenticationMiddleware web_auth_middleware;
 static MyTimer ota_progress_timer = MyTimer(1000);
 
 #include "advanced_battery_html.h"
+#include "cellwatch_html.h"
 #include "can_logging_html.h"
 #include "can_replay_html.h"
 #include "cellmonitor_html.h"
@@ -754,6 +755,54 @@ void init_webserver() {
       }
     }
     request->send(200, "text/plain", "OK");
+  });
+
+  // Cellwatch: runtime-only diagnostic (fast single-cell poll), NOT persisted to NVM on purpose - always
+  // starts disabled after a reboot, see datalayer_extended.h.
+  def_route_with_auth("/editTwingoCellwatchEnable", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("value")) {
+      bool enable = request->getParam("value")->value().toInt() != 0;
+      datalayer_extended.twingoGen1.cellwatch_enabled = enable;
+      if (enable) {
+        // Fresh watch session: start the sample count/last value from zero rather than carrying over
+        // a stale reading from a previous run or from the normal round-robin.
+        datalayer_extended.twingoGen1.cellwatch_last_mV = 0;
+        datalayer_extended.twingoGen1.cellwatch_sample_count = 0;
+        datalayer_extended.twingoGen1.cellwatch_last_sample_ms = 0;
+      }
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  def_route_with_auth("/editTwingoCellwatchCell", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("value")) {
+      int value = request->getParam("value")->value().toInt();
+      if (value >= 1 && value <= 96) {
+        datalayer_extended.twingoGen1.cellwatch_cell = (uint8_t)value;
+        // Changing cell mid-watch would otherwise mix samples from two different cells into one
+        // count/series - reset so the next sample starts a clean run for the newly selected cell.
+        datalayer_extended.twingoGen1.cellwatch_last_mV = 0;
+        datalayer_extended.twingoGen1.cellwatch_sample_count = 0;
+        datalayer_extended.twingoGen1.cellwatch_last_sample_ms = 0;
+      }
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  // Lightweight status read for the /cellwatch page's polling loop - plain text, pipe-separated, cheap
+  // to generate and parse, no HTML/JSON overhead: enabled|cell|lastMV|sampleCount|lastSampleMs
+  def_route_with_auth("/cellwatchStatus", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    String s = String(datalayer_extended.twingoGen1.cellwatch_enabled ? 1 : 0) + "|" +
+               String(datalayer_extended.twingoGen1.cellwatch_cell) + "|" +
+               String(datalayer_extended.twingoGen1.cellwatch_last_mV) + "|" +
+               String(datalayer_extended.twingoGen1.cellwatch_sample_count) + "|" +
+               String(datalayer_extended.twingoGen1.cellwatch_last_sample_ms);
+    request->send(200, "text/plain", s);
+  });
+
+  // Route for going to the Cellwatch test page
+  def_route_with_auth("/cellwatch", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(200, "text/html", index_html, cellwatch_processor);
   });
 
   // Isolation monitor control (RoutineControl 0x2008). One setting, applied to both batteries.

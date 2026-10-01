@@ -874,6 +874,14 @@ void RenaultTwingoGen1Battery::transmit_reset_nvrol_frames(void) {
 // polling resumes from here. wake_tracking/wake_start_ms/wake_first_* were already set by
 // start_wake_burst() when the burst began, so the "how fast did it come back" timers cover the burst too.
 void RenaultTwingoGen1Battery::finish_nvrol_silence(void) {
+  // Upstream's CAN_error_counter (safety.cpp, MAX_CAN_FAILURES=50) is never reset anywhere in
+  // production code - once it crosses the threshold, EVENT_CAN_CORRUPTED_WARNING stays "active"
+  // forever and its Count display climbs by 1 on every 1Hz update_machineryprotection() pass, even
+  // with zero new corrupted frames (confirmed 01.10.: record_silence_frame showed 0 RX for 10+ min
+  // while Count kept climbing). Reset it here, right after a successful wake-up resumes normal
+  // communication - a fresh polling cycle is the natural "clean slate" point, same spirit as the
+  // other per-wake resets below (bms_state_valid, bal_valid, temp filters).
+  datalayer_battery->status.CAN_error_counter = 0;
   nvrol_silence_done = true;
   nvrol_last_mode = nvrol_mode;
   nvrol_mode = 0;
@@ -1448,12 +1456,15 @@ void RenaultTwingoGen1Battery::append_refresh_script_html(String& s, bool busy) 
 
 void RenaultTwingoGen1Battery::handle_incoming_can_frame(CAN_frame rx_frame) {
 #ifdef TWINGO_EXTENDED_CELL_POLLING
-  if (NVROLstateMachine == 5 || NVROLstateMachine == 7) {
+  if (NVROLstateMachine == 5 || NVROLstateMachine == 7 || NVROLstateMachine == 8) {
     // Recording runs from the start of the shutdown announcement (state 7: C3/C2/C0/00) all the way
-    // through true silence (state 5), on one continuous timeline - so we can see whether the BMS reacts
-    // at all to the announced C3/C2/C0 states, not just whether it eventually goes quiet.
+    // through true silence (state 5) AND the wake-up burst (state 8), on one continuous timeline - so
+    // we can see what the BMS actually sends right after Wake up (e.g. the first 0x155 frames that
+    // feed real_soc), not just whether/when it reacts. Kept as a separate condition from the
+    // wake_first_rx tracking below (not else-if) so a frame seen during state 8 still counts for both.
     record_silence_frame(rx_frame);
-  } else if (wake_tracking && wake_first_rx < 0) {
+  }
+  if (wake_tracking && wake_first_rx < 0 && NVROLstateMachine != 5 && NVROLstateMachine != 7) {
     wake_first_rx = (int32_t)(millis() - wake_start_ms);  // first frame after Wake up
   }
 #endif
@@ -1552,6 +1563,9 @@ void RenaultTwingoGen1Battery::handle_incoming_can_frame(CAN_frame rx_frame) {
         // ReadDataByIdentifier ones - handle_extended_reply() would
         // misparse them (it assumes a PID sits at bytes 2-3).
         handle_nvrol_reply(rx_frame);
+      } else if (dtc_ext_state == DTC_EXT_READ_CMD_SENT || dtc_ext_state == DTC_EXT_ERASE_CMD_SENT) {
+        // Same reasoning as above: a DTC Read/Erase reply isn't a ReadDataByIdentifier reply either.
+        handle_dtc_ext_reply(rx_frame);
       } else {
         handle_extended_reply(rx_frame);
       }
@@ -1777,6 +1791,7 @@ void RenaultTwingoGen1Battery::transmit_can(unsigned long currentMillis) {
     // normal extended polling, since both share the ZOE_POLL_18DADBF1 frame object below.
     transmit_reset_nvrol_frames();
   } else {
+  handle_dtc_ext(currentMillis);  // DTC Read/Erase probe (see read_DTC()/reset_DTC()), if one is running
   // Extended-address polling: cycle through the 119 poll targets (96 cell
   // voltages + balancing + 4 lifetime metrics + temporisation + 8 pack
   // temperatures + BMS state + 6 balancing counters + 2 time PIDs), one every 200ms (same
@@ -1949,7 +1964,9 @@ String RenaultTwingoGen1Battery::get_uds_info_html() {
              "NVROL Log - Session2: " << nvrol_log[2] << "<br>"
              "NVROL Log - Write 9281=0 (activated): " << nvrol_log[3] << "<br>"
              "NVROL Log - Read back 0x9281: " << nvrol_log[4] << "<br>"
-             "Temporisation right after the write (read back): " << temporisation_text(temporisation_readback) << "<br>";
+             "Temporisation right after the write (read back): " << temporisation_text(temporisation_readback) << "<br>"
+             "DTC Read (ext. protocol, Read DTC button): " << dtc_ext_log_read << "<br>"
+             "DTC Erase (ext. protocol, Erase DTC button): " << dtc_ext_log_erase << "<br>";
   // clang-format on
   append_quiet_html(content);
   content << "</div>";
@@ -1989,17 +2006,105 @@ void RenaultTwingoGen1Battery::setup(void) {  // Performs one time setup at star
 #endif
 }
 
-static const uint16_t ZOE_STATE_OPEN_SESSION = 1;
-
-void RenaultTwingoGen1Battery::read_DTC() {
-  start_sequence(ZOE_STATE_OPEN_SESSION);
+// The generic UdsCanBattery sequence machinery (start_sequence/send_sequence_message/
+// on_uds_sequence_step) is bound to setup_uds(0x79B, 0x7BB) - the standard KWP2000 path, which
+// RenoLink confirmed (01.10.) never answers on this battery (same dead path as the generic
+// supports_read_DTC()/supports_reset_DTC() buttons' default implementation would have used). read_DTC()
+// and reset_DTC() below are therefore NOT routed through that machinery at all; they drive the separate
+// dtc_ext_* state machine instead, which talks to the extended 29-bit protocol (0x18DADBF1/0x18DAF1DB)
+// that this battery actually responds to for everything else (NVROL, 0x9281, cell polling).
+void RenaultTwingoGen1Battery::on_uds_sequence_step(uint16_t state, uint8_t sid, const uint8_t* data, uint16_t len) {
+  // Intentionally empty - see comment above.
 }
 
-void RenaultTwingoGen1Battery::on_uds_sequence_step(uint16_t state, uint8_t sid, const uint8_t* data, uint16_t len) {
-  if (state == ZOE_STATE_OPEN_SESSION) {
-    send_sequence_message(ZOE_STATE_OPEN_SESSION + 10, SID::DiagnosticSessionControl, (const uint8_t*)"\xC0", 1, 20, 2);
-  } else if (state == ZOE_STATE_OPEN_SESSION + 10 && sid == UDS_RESPONSE_SID_OF(SID::DiagnosticSessionControl)) {
-    // Session 0xC0 granted! Transmit UDS ReadDTCInformation with status mask 0x09 (Active/Confirmed DTCs)
-    send_sequence_message(UDS_STATE_READ_DTC, SID::ReadDTCInformation, (const uint8_t*)"\x02\x09", 2, 20, 2);
+void RenaultTwingoGen1Battery::read_DTC() {
+  if (dtc_ext_state != DTC_EXT_IDLE || UserRequestNVROLReset) {
+    return;  // already busy with a DTC exchange, or a Sleep/NVROL sequence is running
   }
+  ZOE_POLL_18DADBF1.data = {0x02, 0x10, 0x03, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};  // open extended session
+  transmit_can_frame(&ZOE_POLL_18DADBF1);
+  strncpy(dtc_ext_log_read, "requested", sizeof(dtc_ext_log_read) - 1);
+  dtc_ext_log_read[sizeof(dtc_ext_log_read) - 1] = '\0';
+  dtc_ext_state = DTC_EXT_READ_SESSION_SENT;
+  dtc_ext_step_start_ms = millis();
+}
+
+void RenaultTwingoGen1Battery::reset_DTC() {
+  if (dtc_ext_state != DTC_EXT_IDLE || UserRequestNVROLReset) {
+    return;
+  }
+  ZOE_POLL_18DADBF1.data = {0x02, 0x10, 0x03, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};  // open extended session
+  transmit_can_frame(&ZOE_POLL_18DADBF1);
+  strncpy(dtc_ext_log_erase, "requested", sizeof(dtc_ext_log_erase) - 1);
+  dtc_ext_log_erase[sizeof(dtc_ext_log_erase) - 1] = '\0';
+  dtc_ext_state = DTC_EXT_ERASE_SESSION_SENT;
+  dtc_ext_step_start_ms = millis();
+}
+
+// Drives the DTC Read/Erase probe: open an extended diagnostic session (0x10 0x03, same subfunction
+// used successfully for the 0x9281 sequence - NOT the 0xC0 session the old, broken read_DTC() used to
+// send), wait DTC_EXT_SESSION_GAP_MS (mirrors the NVROL sequence's own 100ms pacing between steps, not
+// a measured requirement of this BMS), then send the actual service. The raw reply (or its absence) is
+// logged verbatim via handle_dtc_ext_reply() / the timeout branch below - nothing about the response is
+// assumed or parsed into a DTC list, since none has ever been seen on this battery.
+void RenaultTwingoGen1Battery::handle_dtc_ext(unsigned long currentMillis) {
+  switch (dtc_ext_state) {
+    case DTC_EXT_IDLE:
+      break;
+
+    case DTC_EXT_READ_SESSION_SENT:
+      if (currentMillis - dtc_ext_step_start_ms >= DTC_EXT_SESSION_GAP_MS) {
+        // Gap elapsed: send ReadDTCInformation, status mask 0x09 (Active/Confirmed) - same mask the
+        // old, broken KWP path used, for comparability if it ever does answer too.
+        ZOE_POLL_18DADBF1.data = {0x03, 0x19, 0x02, 0x09, 0xAA, 0xAA, 0xAA, 0xAA};
+        transmit_can_frame(&ZOE_POLL_18DADBF1);
+        dtc_ext_step_start_ms = currentMillis;
+        dtc_ext_state = DTC_EXT_READ_CMD_SENT;
+      }
+      break;
+    case DTC_EXT_READ_CMD_SENT:
+      if (currentMillis - dtc_ext_step_start_ms >= DTC_EXT_REPLY_TIMEOUT_MS) {
+        strncpy(dtc_ext_log_read, "no response", sizeof(dtc_ext_log_read) - 1);
+        dtc_ext_log_read[sizeof(dtc_ext_log_read) - 1] = '\0';
+        dtc_ext_state = DTC_EXT_IDLE;
+      }
+      break;
+
+    case DTC_EXT_ERASE_SESSION_SENT:
+      if (currentMillis - dtc_ext_step_start_ms >= DTC_EXT_SESSION_GAP_MS) {
+        // ClearDiagnosticInformation, group 0xFFFFFF (all groups) - same group Zoe Gen2's existing,
+        // upstream Erase DTC button uses on this same protocol.
+        ZOE_POLL_18DADBF1.data = {0x04, 0x14, 0xFF, 0xFF, 0xFF, 0xAA, 0xAA, 0xAA};
+        transmit_can_frame(&ZOE_POLL_18DADBF1);
+        dtc_ext_step_start_ms = currentMillis;
+        dtc_ext_state = DTC_EXT_ERASE_CMD_SENT;
+      }
+      break;
+    case DTC_EXT_ERASE_CMD_SENT:
+      if (currentMillis - dtc_ext_step_start_ms >= DTC_EXT_REPLY_TIMEOUT_MS) {
+        strncpy(dtc_ext_log_erase, "no response", sizeof(dtc_ext_log_erase) - 1);
+        dtc_ext_log_erase[sizeof(dtc_ext_log_erase) - 1] = '\0';
+        dtc_ext_state = DTC_EXT_IDLE;
+      }
+      break;
+  }
+}
+
+// Logs whatever came back, verbatim - same format as handle_nvrol_reply() (OK raw=.. / NEGATIVE SID=../
+// short reply / unexpected multi-frame), reused here since the two state machines never run at once.
+void RenaultTwingoGen1Battery::handle_dtc_ext_reply(CAN_frame rx_frame) {
+  char* log = (dtc_ext_state == DTC_EXT_READ_CMD_SENT) ? dtc_ext_log_read : dtc_ext_log_erase;
+  uint8_t pci = rx_frame.data.u8[0];
+  if (pci >= 0x10) {
+    snprintf(log, 48, "unexpected multi-frame (PCI=0x%02X)", pci);
+  } else if (pci < 3) {
+    snprintf(log, 48, "short reply (%u bytes)", pci);
+  } else if (rx_frame.data.u8[1] == 0x7F) {
+    snprintf(log, 48, "NEGATIVE SID=0x%02X NRC=0x%02X", rx_frame.data.u8[2], rx_frame.data.u8[3]);
+  } else {
+    snprintf(log, 48, "OK raw=%02X %02X %02X %02X %02X %02X %02X", rx_frame.data.u8[1], rx_frame.data.u8[2],
+             rx_frame.data.u8[3], rx_frame.data.u8[4], rx_frame.data.u8[5], rx_frame.data.u8[6],
+             rx_frame.data.u8[7]);
+  }
+  dtc_ext_state = DTC_EXT_IDLE;  // reply seen - no need to wait out the timeout
 }

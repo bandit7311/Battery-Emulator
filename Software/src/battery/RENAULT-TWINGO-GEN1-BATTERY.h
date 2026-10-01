@@ -86,6 +86,7 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   const char* get_dtc_json_filename() override { return "renault_zoe_gen1_dtc.json"; }
   bool get_dtc_standard_code_string() override { return false; }
   void read_DTC() override;
+  void reset_DTC() override;
 #ifdef TWINGO_EXTENDED_CELL_POLLING
   bool supports_reset_NVROL() override { return true; }
   void reset_NVROL() override { start_nvrol_run(0); }
@@ -553,6 +554,30 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   uint16_t temporisation_readback = 0x100;  // raw byte of 0x9281 read right after the write, 0x100 = none
   uint8_t nvrol_awaiting_step = 0;  // Which nvrol_log[] slot the next 0x18DAF1DB reply belongs to
   void handle_nvrol_reply(CAN_frame rx_frame);
+
+  // DTC Read/Erase over the extended 29-bit protocol (0x18DADBF1/0x18DAF1DB) - the only protocol that
+  // actually gets answered on this battery (RenoLink confirmed the standard 0x79B/0x7BB path is dead
+  // here). Reuses the existing "Read DTC"/"Erase DTC" buttons (read_DTC()/reset_DTC() overrides below)
+  // instead of adding new ones. Separate, minimal state machine, independent of NVROLstateMachine;
+  // guarded to not start while a Sleep/NVROL sequence is running. Logs the raw response exactly like
+  // nvrol_log - nothing about the response format/content is assumed, since it has never been seen.
+  // Note: do not use Cellwatch and DTC Read/Erase at the same time - both share the same single-flight
+  // extended-protocol exchange, running them together could cross-wire which request a reply belongs to.
+  enum DtcExtState : uint8_t {
+    DTC_EXT_IDLE = 0,
+    DTC_EXT_READ_SESSION_SENT,  // session frame sent, waiting DTC_EXT_SESSION_GAP_MS before the command
+    DTC_EXT_READ_CMD_SENT,      // command frame sent, waiting for a reply or DTC_EXT_REPLY_TIMEOUT_MS
+    DTC_EXT_ERASE_SESSION_SENT,
+    DTC_EXT_ERASE_CMD_SENT
+  };
+  uint8_t dtc_ext_state = DTC_EXT_IDLE;
+  unsigned long dtc_ext_step_start_ms = 0;
+  static const unsigned long DTC_EXT_SESSION_GAP_MS = 100;    // matches the NVROL sequence's own pacing
+  static const unsigned long DTC_EXT_REPLY_TIMEOUT_MS = 300;  // unverified - first probe, not a known-good value
+  char dtc_ext_log_read[48] = "not run yet";
+  char dtc_ext_log_erase[48] = "not run yet";
+  void handle_dtc_ext(unsigned long currentMillis);
+  void handle_dtc_ext_reply(CAN_frame rx_frame);
 
   // Quiet phase (NVROLstateMachine == 5). UserRequestNVROLReset stays true during the whole time.
   static const unsigned long NVROL_SILENCE_MS = 45000;

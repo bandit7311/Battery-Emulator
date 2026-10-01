@@ -214,6 +214,21 @@ struct DATALAYER_INFO_BYDATTO3 {
   uint8_t iso_command_status;   // 0 idle, 1 running, 2 accepted, 3 rejected, 4 no reply
 };
 
+struct DATALAYER_INFO_TWINGO_GEN1 {
+  /** Byte written to PID 0x9281 by "Sleep 0x9281=1" and by the NVROL-reset temporisation-write step.
+   *  0 = "temporisation is activated" per a real RBMS_MCPU_RL ECU dump (default); 1 = the other,
+   *  previously-assumed value. Settable on "More Battery Info", persisted to NVM. */
+  uint8_t nvrol_temporisation_write_value;
+  /** Diagnostic session opened (SID 0x10) before RoutineControl 0xB009 during an NVROL reset.
+   *  false = Extended (subfunction 0x03, default, currently answers NEGATIVE/NRC 0x7F); true = Programming
+   *  (subfunction 0x02, untested). Settable on "More Battery Info", persisted to NVM. */
+  bool nvrol_b009_use_programming_session;
+  /** Manual sleep failsafe window in minutes (Sleep / Sleep 0x9281=1 / NVROL reset all wake up on their own
+   *  after this many minutes of true silence if "Wake up" is never pressed). Settable on "More Battery
+   *  Info", persisted to NVM. Clamped to 1-1440 by the driver if out of range. */
+  uint16_t sleep_failsafe_minutes;
+};
+
 struct DATALAYER_INFO_CELLPOWER {
   /** bool */
   /** All values either True or false */
@@ -1038,6 +1053,7 @@ class DataLayerExtended {
   DATALAYER_INFO_VOLVO_POLESTAR VolvoPolestar;
   DATALAYER_INFO_GEELY_SEA GeelySEA;
   DATALAYER_INFO_ZOE_PH2 zoePH2;
+  DATALAYER_INFO_TWINGO_GEN1 twingoGen1;
 
   DataLayerExtended() {
     memset(this, 0, sizeof(DataLayerExtended));
@@ -1053,6 +1069,10 @@ class DataLayerExtended {
     };
     initBydAtto3(bydAtto3);
     initBydAtto3(bydAtto3_2);
+
+    // nvrol_temporisation_write_value = 0 and nvrol_b009_use_programming_session = false are already
+    // correct via the memset(0) above; only the non-zero default needs setting here.
+    twingoGen1.sleep_failsafe_minutes = 30;
   }
 };
 

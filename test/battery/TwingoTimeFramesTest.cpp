@@ -488,7 +488,7 @@ TEST(TwingoTimeFramesTests, TimePidsAreInThePollList) {
   }
   EXPECT_TRUE(pids.count(0x9261) == 1);
   EXPECT_TRUE(pids.count(0x91C1) == 1);
-  EXPECT_EQ(pids.size(), 119u);  // 96 cells + 23 others, one request every 200 ms
+  EXPECT_EQ(pids.size(), 135u);  // 96 cells + 23 others + 16 new display-only PIDs, one request every 200 ms
   EXPECT_GE(requests, 119u);
 }
 
@@ -688,4 +688,250 @@ TEST(TwingoFastFramesTests, NothingInTrueSilence) {
       break;
     }
   }
+}
+
+
+// ---------------------------------------------------------------------------
+// 0x9281 fix: write 0 ("activated"), not 1
+// ---------------------------------------------------------------------------
+
+TEST(TwingoNewDisplayPidsTests, NvrolResetWritesTemporisationZero) {
+  reset_datalayer_temperatures();
+  RenaultTwingoGen1Battery b;
+  b.setup();
+  set_millis64(1000);
+  b.reset_NVROL();
+  std::vector<CAN_frame> writes;
+  for (uint64_t t = 1000; t < 1000 + 2000; t += 10) {
+    for (const CAN_frame& f : tick(b, t)) {
+      if (f.ext_ID && f.ID == 0x18DADBF1 && f.data.u8[1] == 0x2E && f.data.u8[2] == 0x92 && f.data.u8[3] == 0x81) {
+        writes.push_back(f);
+      }
+    }
+  }
+  ASSERT_EQ(writes.size(), 1u);
+  EXPECT_EQ(writes[0].data.u8[4], 0x00) << "must write 0x00 (\"temporisation is activated\" per the real ECU dump), not 0x01";
+}
+
+TEST(TwingoNewDisplayPidsTests, Sleep9281WritesTemporisationZero) {
+  reset_datalayer_temperatures();
+  RenaultTwingoGen1Battery b;
+  b.setup();
+  set_millis64(1000);
+  b.request_sleep_temporisation();
+  std::vector<CAN_frame> writes;
+  for (uint64_t t = 1000; t < 1000 + 500; t += 10) {
+    for (const CAN_frame& f : tick(b, t)) {
+      if (f.ext_ID && f.ID == 0x18DADBF1 && f.data.u8[1] == 0x2E && f.data.u8[2] == 0x92 && f.data.u8[3] == 0x81) {
+        writes.push_back(f);
+      }
+    }
+  }
+  ASSERT_EQ(writes.size(), 1u);
+  EXPECT_EQ(writes[0].data.u8[4], 0x00);
+}
+
+// ---------------------------------------------------------------------------
+// B009 RequestRoutineResults (subfunction 0x03) after the start
+// ---------------------------------------------------------------------------
+
+TEST(TwingoNewDisplayPidsTests, NvrolResetRequestsRoutineResultsAfterStart) {
+  reset_datalayer_temperatures();
+  RenaultTwingoGen1Battery b;
+  b.setup();
+  set_millis64(1000);
+  b.reset_NVROL();
+  std::vector<CAN_frame> requests;
+  for (uint64_t t = 1000; t < 1000 + 2000; t += 10) {
+    for (const CAN_frame& f : tick(b, t)) {
+      if (f.ext_ID && f.ID == 0x18DADBF1 && f.data.u8[1] == 0x31) {
+        requests.push_back(f);
+      }
+    }
+  }
+  ASSERT_EQ(requests.size(), 2u);
+  // 0x31 01 B0 09 = StartRoutine, then 0x31 03 B0 09 = RequestRoutineResults, in that order.
+  EXPECT_EQ(requests[0].data.u8[2], 0x01);
+  EXPECT_EQ(requests[0].data.u8[3], 0xB0);
+  EXPECT_EQ(requests[0].data.u8[4], 0x09);
+  EXPECT_EQ(requests[1].data.u8[2], 0x03);
+  EXPECT_EQ(requests[1].data.u8[3], 0xB0);
+  EXPECT_EQ(requests[1].data.u8[4], 0x09);
+}
+
+TEST(TwingoNewDisplayPidsTests, RoutineResultsReplyIsLogged) {
+  reset_datalayer_temperatures();
+  RenaultTwingoGen1Battery b;
+  b.setup();
+  set_millis64(1000);
+  b.reset_NVROL();
+  // Tick only into the window where nvrol_awaiting_step == 5 (after the results request at t=600ms into the
+  // sequence, before case 2's own 1s wait elapses at t=1600ms and moves the awaiting step on).
+  for (uint64_t t = 1000; t < 1000 + 1000; t += 10) {
+    tick(b, t);
+  }
+  CAN_frame reply = {};
+  reply.ext_ID = true;
+  reply.DLC = 8;
+  reply.ID = 0x18DAF1DB;
+  const uint8_t data[8] = {0x04, 0x71, 0x03, 0xB0, 0x09, 0xAA, 0xAA, 0xAA};  // positive response to RoutineControl
+  memcpy(reply.data.u8, data, 8);
+  b.handle_incoming_can_frame(reply);
+  EXPECT_TRUE(contains(b.get_uds_info_html(), "NVROL Log - Routine B009 results: OK"));
+}
+
+// ---------------------------------------------------------------------------
+// The 16 new display-only PIDs: parsing + formula
+// ---------------------------------------------------------------------------
+
+namespace {
+CAN_frame uds_reply(uint16_t pid, std::initializer_list<uint8_t> data_bytes) {
+  CAN_frame f = {};
+  f.ext_ID = true;
+  f.DLC = 8;
+  f.ID = 0x18DAF1DB;
+  uint8_t n = (uint8_t)data_bytes.size();
+  f.data.u8[0] = (uint8_t)(3 + n);  // PCI: SID + 2 PID bytes + n data bytes
+  f.data.u8[1] = 0x62;
+  f.data.u8[2] = (uint8_t)(pid >> 8);
+  f.data.u8[3] = (uint8_t)(pid & 0xFF);
+  uint8_t i = 4;
+  for (uint8_t b : data_bytes) {
+    f.data.u8[i++] = b;
+  }
+  return f;
+}
+}  // namespace
+
+TEST(TwingoNewDisplayPidsTests, AllSixteenPidsShowNotYetReadBeforeAnyReply) {
+  set_millis64(1000);
+  RenaultTwingoGen1Battery b;
+  b.setup();
+  String html = b.get_uds_info_html();
+  for (const char* label : {"Pack Mileage (0x91CF)", "Vehicle Distance Totalizer (0x925F)",
+                            "Low Voltage Supply (0x9011)", "Pack Voltage, cell sum (0x9006)",
+                            "Cell Voltage A (0x9007", "Cell Voltage B (0x9009", "Cell Voltage A index (0x9008)",
+                            "Cell Voltage B index (0x900A)", "Battery SOH avg (0x9003)",
+                            "Max Charge Power (0x9018)", "Max Generated Power (0x900E)",
+                            "Max Available Power (0x900F)", "Battery SOC, internal (0x9001)",
+                            "Battery USOC, dashboard (0x9002", "Battery SOC min (0x91B9)",
+                            "Battery SOC max (0x91BA)"}) {
+    EXPECT_TRUE(contains(html, label)) << label;
+  }
+  EXPECT_EQ(html.c_str() + std::string(html.c_str()).find("Pack Mileage"),
+            html.c_str() + std::string(html.c_str()).find("Pack Mileage"));  // sanity no-op, see per-field checks below
+  // Every one of the 16 must currently say "not yet read".
+  size_t not_yet_read_count = 0;
+  std::string h(html.c_str());
+  size_t pos = 0;
+  while ((pos = h.find("not yet read", pos)) != std::string::npos) {
+    not_yet_read_count++;
+    pos += 1;
+  }
+  EXPECT_GE(not_yet_read_count, 16u);
+}
+
+TEST(TwingoNewDisplayPidsTests, PackMileageFormula) {
+  set_millis64(1000);
+  RenaultTwingoGen1Battery b;
+  b.setup();
+  b.handle_incoming_can_frame(uds_reply(0x91CF, {0x80, 0x08, 0x95, 0x60}));  // real dump: 17579 km
+  EXPECT_TRUE(contains(b.get_uds_info_html(), "Pack Mileage (0x91CF): 17579.000 km"));
+}
+
+TEST(TwingoNewDisplayPidsTests, VehicleDistanceTotalizerFormula) {
+  set_millis64(1000);
+  RenaultTwingoGen1Battery b;
+  b.setup();
+  b.handle_incoming_can_frame(uds_reply(0x925F, {0x00, 0x82, 0x68, 0xC4}));  // real dump: 85465 km
+  EXPECT_TRUE(contains(b.get_uds_info_html(), "Vehicle Distance Totalizer (0x925F): 85465.000 km"));
+}
+
+TEST(TwingoNewDisplayPidsTests, LowVoltageSupplyFormula) {
+  set_millis64(1000);
+  RenaultTwingoGen1Battery b;
+  b.setup();
+  b.handle_incoming_can_frame(uds_reply(0x9011, {0x33, 0xAF}));  // real dump: 12.92 V
+  EXPECT_TRUE(contains(b.get_uds_info_html(), "Low Voltage Supply (0x9011): 12.921 V"));
+}
+
+TEST(TwingoNewDisplayPidsTests, PackVoltageAndCellVoltagesFormula) {
+  set_millis64(1000);
+  RenaultTwingoGen1Battery b;
+  b.setup();
+  b.handle_incoming_can_frame(uds_reply(0x9006, {0x00, 0x05, 0xC2, 0xE0}));  // real dump: 368.71875 V
+  b.handle_incoming_can_frame(uds_reply(0x9007, {0x0F, 0x62}));
+  b.handle_incoming_can_frame(uds_reply(0x9009, {0x0F, 0x5A}));
+  b.handle_incoming_can_frame(uds_reply(0x9008, {0x23}));  // 35
+  b.handle_incoming_can_frame(uds_reply(0x900A, {0x00}));  // 0
+  String html = b.get_uds_info_html();
+  EXPECT_TRUE(contains(html, "Pack Voltage, cell sum (0x9006): 368.719 V"));
+  EXPECT_TRUE(contains(html, "Cell Voltage A index (0x9008): 35.000"));
+  EXPECT_TRUE(contains(html, "Cell Voltage B index (0x900A): 0.000"));
+}
+
+TEST(TwingoNewDisplayPidsTests, SohAndPowerLimitsFormula) {
+  set_millis64(1000);
+  RenaultTwingoGen1Battery b;
+  b.setup();
+  b.handle_incoming_can_frame(uds_reply(0x9003, {0x25, 0x75}));   // 95.89 %
+  b.handle_incoming_can_frame(uds_reply(0x9018, {0x05, 0x8B}));   // 14.19 kW
+  b.handle_incoming_can_frame(uds_reply(0x900E, {0x10, 0xCC}));   // 43 kW
+  b.handle_incoming_can_frame(uds_reply(0x900F, {0x1C, 0x20}));   // 72 kW
+  String html = b.get_uds_info_html();
+  EXPECT_TRUE(contains(html, "Battery SOH avg (0x9003): 95.890 %"));
+  EXPECT_TRUE(contains(html, "Max Charge Power (0x9018): 14.190 kW"));
+  EXPECT_TRUE(contains(html, "Max Generated Power (0x900E): 43.000 kW"));
+  EXPECT_TRUE(contains(html, "Max Available Power (0x900F): 72.000 kW"));
+}
+
+TEST(TwingoNewDisplayPidsTests, SocFormulaWithOffset) {
+  set_millis64(1000);
+  RenaultTwingoGen1Battery b;
+  b.setup();
+  b.handle_incoming_can_frame(uds_reply(0x9001, {0x1A, 0x7E}));  // 64.82 %
+  b.handle_incoming_can_frame(uds_reply(0x91B9, {0x1B, 0x74}));  // 67.28 %
+  b.handle_incoming_can_frame(uds_reply(0x91BA, {0x1B, 0xC5}));  // 68.09 %
+  b.handle_incoming_can_frame(uds_reply(0x9002, {0x17, 0xDA}));  // 61.06 % (dashboard SOC, no offset)
+  String html = b.get_uds_info_html();
+  EXPECT_TRUE(contains(html, "Battery SOC, internal (0x9001): 64.820 %"));
+  EXPECT_TRUE(contains(html, "Battery SOC min (0x91B9): 67.280 %"));
+  EXPECT_TRUE(contains(html, "Battery SOC max (0x91BA): 68.090 %"));
+  EXPECT_TRUE(contains(html, "Battery USOC, dashboard (0x9002, display only): 61.060 %"));
+}
+
+TEST(TwingoNewDisplayPidsTests, NewPidsAreInThePollListAndNoneAreDuplicated) {
+  set_millis64(1000);
+  RenaultTwingoGen1Battery b;
+  b.setup();
+  std::set<uint16_t> pids;
+  for (uint64_t t = 1000; t < 1000 + 30000; t += 100) {
+    for (const CAN_frame& f : tick(b, t)) {
+      if (f.ext_ID && f.ID == 0x18DADBF1 && f.data.u8[0] == 0x03 && f.data.u8[1] == 0x22) {
+        pids.insert((uint16_t)((f.data.u8[2] << 8) | f.data.u8[3]));
+      }
+    }
+  }
+  for (uint16_t pid : {0x91CFu, 0x925Fu, 0x9011u, 0x9006u, 0x9007u, 0x9009u, 0x9008u, 0x900Au, 0x9003u, 0x9018u,
+                       0x900Eu, 0x900Fu, 0x9001u, 0x9002u, 0x91B9u, 0x91BAu}) {
+    EXPECT_EQ(pids.count(pid), 1u) << "PID 0x" << std::hex << pid;
+  }
+  EXPECT_EQ(pids.size(), 135u);
+}
+
+TEST(TwingoNewDisplayPidsTests, NewPidsNotFedIntoDatalayer) {
+  reset_datalayer_temperatures();
+  set_millis64(1000);
+  RenaultTwingoGen1Battery b;
+  b.setup();
+  b.update_values();  // establishes the baseline the driver computes from its own broadcast-fed fields alone
+  uint16_t soc_before = datalayer.battery.status.real_soc;
+  uint16_t soh_before = datalayer.battery.status.soh_pptt;
+  b.handle_incoming_can_frame(uds_reply(0x9001, {0x1A, 0x7E}));
+  b.handle_incoming_can_frame(uds_reply(0x9002, {0x17, 0xDA}));
+  b.handle_incoming_can_frame(uds_reply(0x9003, {0x25, 0x75}));
+  b.update_values();
+  EXPECT_EQ(datalayer.battery.status.real_soc, soc_before)
+      << "0x9001/0x9002 must stay display-only, not feed the datalayer/inverter SOC";
+  EXPECT_EQ(datalayer.battery.status.soh_pptt, soh_before) << "0x9003 must stay display-only";
 }

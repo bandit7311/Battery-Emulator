@@ -1,5 +1,6 @@
 #include "RENAULT-TWINGO-GEN1-BATTERY.h"
 #include "../datalayer/datalayer.h"
+#include "../datalayer/datalayer_extended.h"
 #include "../devboard/utils/common_functions.h"  // crc8_table_SAE_J1850_ZER0
 #include "../devboard/utils/events.h"
 #include "../devboard/utils/logging.h"
@@ -105,6 +106,23 @@ void RenaultTwingoGen1Battery::
   calculated_total_pack_voltage_mV = ((LB_Cell_minimum_voltage + LB_Cell_maximum_voltage) / 2) * 96;
 #endif
   datalayer_battery->status.voltage_dV = ((calculated_total_pack_voltage_mV / 100));  // mV to dV
+
+#ifdef TWINGO_EXTENDED_CELL_POLLING
+  // Sleep run in progress (Sleep / Sleep 0x9281=1 / NVROL reset, from the button press through the whole
+  // shutdown sequence, true silence and wake burst - UserRequestNVROLReset is only cleared again by
+  // finish_nvrol_silence() once the wake burst has fully completed). While the battery itself is not being
+  // polled, current/voltage/SOC above stay frozen at their last polled values (LB_* simply stop updating) -
+  // that's correct for voltage and SOC, but current must not keep reporting whatever it happened to be at
+  // the moment of the last poll. Force current and both power limits to 0 so the inverter is actively told
+  // "neither charge nor discharge" instead of computing from a stale, possibly non-zero current. The CAN
+  // frames towards the inverter keep going at their normal rate throughout (see PylonInverter::transmit_can(),
+  // which reads these fields unconditionally) - only their content changes here.
+  if (UserRequestNVROLReset) {
+    datalayer_battery->status.current_dA = 0;
+    datalayer_battery->status.max_discharge_power_W = 0;
+    datalayer_battery->status.max_charge_power_W = 0;
+  }
+#endif
 }
 
 uint16_t RenaultTwingoGen1Battery::handle_pid(uint16_t pid, uint32_t value, const uint8_t* data, uint16_t length) {
@@ -246,6 +264,85 @@ void RenaultTwingoGen1Battery::handle_extended_single_frame(uint16_t pid, const 
         }
         time_pid_raw[idx] = v;
         time_pid_len[idx] = n;
+      }
+      break;
+    // Display-only PIDs from the real "RBMS_MCPU_RL" dumps (28.09.): every one of them is stored as the raw
+    // big-endian value of however many data bytes the reply carries (1, 2 or 4 here), the formula from the
+    // header comment is applied only when rendering the HTML page.
+    case EXT_POLL_MILEAGE_PACK:
+    case EXT_POLL_MILEAGE_VEHICLE:
+    case EXT_POLL_LV_SUPPLY:
+    case EXT_POLL_PACK_VOLTAGE:
+    case EXT_POLL_CELL_V_A:
+    case EXT_POLL_CELL_V_B:
+    case EXT_POLL_CELL_V_A_NR:
+    case EXT_POLL_CELL_V_B_NR:
+    case EXT_POLL_SOH_AVG:
+    case EXT_POLL_MAX_CHARGE_POWER:
+    case EXT_POLL_MAX_GEN_POWER:
+    case EXT_POLL_MAX_AVAIL_POWER:
+    case EXT_POLL_SOC_AVG:
+    case EXT_POLL_USOC_AVG:
+    case EXT_POLL_SOC_MIN:
+    case EXT_POLL_SOC_MAX:
+      if (length >= 1) {
+        uint32_t v = 0;
+        for (uint8_t i = 0; i < length; i++) {
+          v = (v << 8) | data[i];
+        }
+        ExtValue* target;
+        switch (pid) {
+          case EXT_POLL_MILEAGE_PACK:
+            target = &ext_mileage_pack;
+            break;
+          case EXT_POLL_MILEAGE_VEHICLE:
+            target = &ext_mileage_vehicle;
+            break;
+          case EXT_POLL_LV_SUPPLY:
+            target = &ext_lv_supply;
+            break;
+          case EXT_POLL_PACK_VOLTAGE:
+            target = &ext_pack_voltage;
+            break;
+          case EXT_POLL_CELL_V_A:
+            target = &ext_cell_v_a;
+            break;
+          case EXT_POLL_CELL_V_B:
+            target = &ext_cell_v_b;
+            break;
+          case EXT_POLL_CELL_V_A_NR:
+            target = &ext_cell_v_a_nr;
+            break;
+          case EXT_POLL_CELL_V_B_NR:
+            target = &ext_cell_v_b_nr;
+            break;
+          case EXT_POLL_SOH_AVG:
+            target = &ext_soh_avg;
+            break;
+          case EXT_POLL_MAX_CHARGE_POWER:
+            target = &ext_max_charge_power;
+            break;
+          case EXT_POLL_MAX_GEN_POWER:
+            target = &ext_max_gen_power;
+            break;
+          case EXT_POLL_MAX_AVAIL_POWER:
+            target = &ext_max_avail_power;
+            break;
+          case EXT_POLL_SOC_AVG:
+            target = &ext_soc_avg;
+            break;
+          case EXT_POLL_USOC_AVG:
+            target = &ext_usoc_avg;
+            break;
+          case EXT_POLL_SOC_MIN:
+            target = &ext_soc_min;
+            break;
+          default:  // EXT_POLL_SOC_MAX
+            target = &ext_soc_max;
+            break;
+        }
+        target->raw = v;
+        target->valid = true;
       }
       break;
     case EXT_POLL_CYCLES:  // 0x9210, 16-bit count, no scaling
@@ -526,6 +623,17 @@ void RenaultTwingoGen1Battery::handle_nvrol_reply(CAN_frame rx_frame) {
 // proven Zoe Ph2 sequence exactly; only the final 30s software-sleep step is
 // omitted on purpose.
 // Enter the shutdown sequence (state 7): 0x350 will start walking C3 -> C2 -> C0 -> 00.
+// Configured sleep failsafe window (minutes, "More Battery Info" web UI, persisted to NVM), clamped to
+// 1-1440 min (24h). Falls back to SLEEP_MANUAL_FAILSAFE_DEFAULT_MIN if the stored value is 0 or out of
+// that range (e.g. before the setting has ever been written).
+unsigned long RenaultTwingoGen1Battery::sleep_manual_failsafe_ms(void) {
+  uint16_t configured_min = datalayer_extended.twingoGen1.sleep_failsafe_minutes;
+  if (configured_min < 1 || configured_min > 1440) {
+    configured_min = SLEEP_MANUAL_FAILSAFE_DEFAULT_MIN;
+  }
+  return (unsigned long)configured_min * 60UL * 1000UL;
+}
+
 void RenaultTwingoGen1Battery::start_powerdown(void) {
   powerdown_stage = 0;
   powerdown_start_ms = millis();
@@ -591,9 +699,15 @@ void RenaultTwingoGen1Battery::transmit_reset_nvrol_frames(void) {
         start_powerdown();
         break;
       }
-      // NVROL reset, part 1: open extended diagnostic session (SID 0x10, subfunction 0x03)
-      ZOE_POLL_18DADBF1.data = {0x02, 0x10, 0x03, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
-      transmit_can_frame(&ZOE_POLL_18DADBF1);
+      // NVROL reset, part 1: open diagnostic session (SID 0x10) before RoutineControl B009. Default
+      // subfunction 0x03 (Extended) - the session type that was tried so far (B009 answered NEGATIVE,
+      // NRC 0x7F serviceNotSupportedInActiveSession, unconfirmed whether Programming (0x02) fixes that).
+      // Configurable via "More Battery Info" (datalayer_extended.twingoGen1.nvrol_b009_use_programming_session).
+      {
+        uint8_t session_sub = datalayer_extended.twingoGen1.nvrol_b009_use_programming_session ? 0x02 : 0x03;
+        ZOE_POLL_18DADBF1.data = {0x02, 0x10, session_sub, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
+        transmit_can_frame(&ZOE_POLL_18DADBF1);
+      }
 #ifdef EXTENDED_UDS_DEBUG
       logging.println("NVROL: step 0 - open session");
 #endif
@@ -601,10 +715,14 @@ void RenaultTwingoGen1Battery::transmit_reset_nvrol_frames(void) {
       break;
     case 1:  // wait 100ms for step 0's response
       if ((millis() - startTimeNVROL) > INTERVAL_100_MS && nvrol_mode == 2) {
-        // "Sleep 0x9281=1": no reset routine, straight to the temporisation write (session is already open)
+        // "Sleep 0x9281=1": no reset routine, straight to the temporisation write (session is already open).
+        // The write value is 0x00, not 0x01: a real "RBMS_MCPU_RL" ECU dump (28.09.) labels the live value
+        // 0x00 of this PID as "temporisation is activated" - the button name is kept as-is (it predates
+        // this finding), only the byte sent has changed.
         strncpy(nvrol_log[1], "skipped (Sleep 0x9281=1)", sizeof(nvrol_log[1]) - 1);
         strncpy(nvrol_log[2], "skipped (Sleep 0x9281=1)", sizeof(nvrol_log[2]) - 1);
-        ZOE_POLL_18DADBF1.data = {0x04, 0x2E, 0x92, 0x81, 0x01, 0xAA, 0xAA, 0xAA};
+        ZOE_POLL_18DADBF1.data = {0x04, 0x2E, 0x92, 0x81, datalayer_extended.twingoGen1.nvrol_temporisation_write_value,
+                                   0xAA, 0xAA, 0xAA};
         transmit_can_frame(&ZOE_POLL_18DADBF1);
         nvrol_awaiting_step = 3;
         startTimeNVROL = millis();
@@ -618,6 +736,18 @@ void RenaultTwingoGen1Battery::transmit_reset_nvrol_frames(void) {
         nvrol_awaiting_step = 1;
 #ifdef EXTENDED_UDS_DEBUG
         logging.println("NVROL: step 1 - start routine B009 (NVROL reset)");
+#endif
+        startTimeNVROL = millis();
+        NVROLstateMachine = 9;
+      }
+      break;
+    case 9:  // wait 500ms, then ask the routine itself for its result (RequestRoutineResults, subfunction 0x03)
+      if ((millis() - startTimeNVROL) > 500) {
+        ZOE_POLL_18DADBF1.data = {0x04, 0x31, 0x03, 0xB0, 0x09, 0x00, 0xAA, 0xAA};
+        transmit_can_frame(&ZOE_POLL_18DADBF1);
+        nvrol_awaiting_step = 5;
+#ifdef EXTENDED_UDS_DEBUG
+        logging.println("NVROL: step 1b - request routine B009 results");
 #endif
         startTimeNVROL = millis();
         NVROLstateMachine = 2;
@@ -638,12 +768,15 @@ void RenaultTwingoGen1Battery::transmit_reset_nvrol_frames(void) {
       break;
     case 3:  // wait 100ms for step 2's response
       if ((millis() - startTimeNVROL) > INTERVAL_100_MS) {
-        // Enable temporisation before sleep, part 2: WriteDataByIdentifier (SID 0x2E) PID 0x9281 = 1
-        ZOE_POLL_18DADBF1.data = {0x04, 0x2E, 0x92, 0x81, 0x01, 0xAA, 0xAA, 0xAA};
+        // Enable temporisation before sleep, part 2: WriteDataByIdentifier (SID 0x2E) PID 0x9281.
+        // Default 0x00 ("temporisation is activated" per a real ECU dump, see the comment above);
+        // configurable to 0x01 via "More Battery Info" (datalayer_extended.twingoGen1.nvrol_temporisation_write_value).
+        ZOE_POLL_18DADBF1.data = {0x04, 0x2E, 0x92, 0x81, datalayer_extended.twingoGen1.nvrol_temporisation_write_value,
+                                   0xAA, 0xAA, 0xAA};
         transmit_can_frame(&ZOE_POLL_18DADBF1);
         nvrol_awaiting_step = 3;
 #ifdef EXTENDED_UDS_DEBUG
-        logging.println("NVROL: step 3 - write temporisation=1");
+        logging.println("NVROL: step 3 - write temporisation (configured value)");
 #endif
         startTimeNVROL = millis();
         NVROLstateMachine = 4;
@@ -701,7 +834,7 @@ void RenaultTwingoGen1Battery::transmit_reset_nvrol_frames(void) {
       break;
     }
     case 5:  // true silence: nothing is transmitted at all (see transmit_can()), only the timer runs
-      if (nvrol_wake_request || (millis() - nvrol_silence_start_ms) >= SLEEP_MANUAL_FAILSAFE_MS) {
+      if (nvrol_wake_request || (millis() - nvrol_silence_start_ms) >= sleep_manual_failsafe_ms()) {
 #ifdef EXTENDED_UDS_DEBUG
         logging.println("NVROL: true silence over, waking up");
 #endif
@@ -910,6 +1043,42 @@ void RenaultTwingoGen1Battery::append_live_html(String& s) {
     s += " %";
   }
   s += "<br>";
+  append_ext_value(s, "Pack Mileage (0x91CF)", ext_mileage_pack, (ext_mileage_pack.raw ^ 0x80000000u) / 32.0, "km");
+  append_ext_value(s, "Vehicle Distance Totalizer (0x925F)", ext_mileage_vehicle, ext_mileage_vehicle.raw * 0.01,
+                    "km");
+  append_ext_value(s, "Low Voltage Supply (0x9011)", ext_lv_supply, ext_lv_supply.raw / 1024.0, "V");
+  append_ext_value(s, "Pack Voltage, cell sum (0x9006)", ext_pack_voltage, ext_pack_voltage.raw * 0.976563 / 1000.0,
+                    "V");
+  append_ext_value(s, "Cell Voltage A (0x9007, min/max not confirmed)", ext_cell_v_a, ext_cell_v_a.raw * 0.976563 / 1000.0,
+                    "V");
+  append_ext_value(s, "Cell Voltage B (0x9009, min/max not confirmed)", ext_cell_v_b, ext_cell_v_b.raw * 0.976563 / 1000.0,
+                    "V");
+  append_ext_value(s, "Cell Voltage A index (0x9008)", ext_cell_v_a_nr, (double)ext_cell_v_a_nr.raw, "");
+  append_ext_value(s, "Cell Voltage B index (0x900A)", ext_cell_v_b_nr, (double)ext_cell_v_b_nr.raw, "");
+  append_ext_value(s, "Battery SOH avg (0x9003)", ext_soh_avg, ext_soh_avg.raw / 100.0, "%");
+  append_ext_value(s, "Max Charge Power (0x9018)", ext_max_charge_power, ext_max_charge_power.raw / 100.0, "kW");
+  append_ext_value(s, "Max Generated Power (0x900E)", ext_max_gen_power, ext_max_gen_power.raw / 100.0, "kW");
+  append_ext_value(s, "Max Available Power (0x900F)", ext_max_avail_power, ext_max_avail_power.raw / 100.0, "kW");
+  append_ext_value(s, "Battery SOC, internal (0x9001)", ext_soc_avg, ext_soc_avg.raw * 0.01 - 3.0, "%");
+  append_ext_value(s, "Battery USOC, dashboard (0x9002, display only)", ext_usoc_avg, ext_usoc_avg.raw * 0.01, "%");
+  append_ext_value(s, "Battery SOC min (0x91B9)", ext_soc_min, ext_soc_min.raw * 0.01 - 3.0, "%");
+  append_ext_value(s, "Battery SOC max (0x91BA)", ext_soc_max, ext_soc_max.raw * 0.01 - 3.0, "%");
+}
+
+void RenaultTwingoGen1Battery::append_ext_value(String& s, const char* label, const ExtValue& v, double value,
+                                                 const char* unit) {
+  s += label;
+  s += ": ";
+  if (!v.valid) {
+    s += "not yet read<br>";
+    return;
+  }
+  s += String(value, 3);
+  if (unit[0] != '\0') {
+    s += " ";
+    s += unit;
+  }
+  s += "<br>";
 }
 
 void RenaultTwingoGen1Battery::priority_answered(uint8_t bit) {
@@ -1040,7 +1209,9 @@ void RenaultTwingoGen1Battery::append_quiet_html(String& s) {
     unsigned long elapsed = now - nvrol_silence_start_ms;
     s += "<b>SILENT for ";
     append_mmss(s, elapsed);
-    s += "</b> (safety limit 30:00) - nothing is sent, do not cut the 12V supply<br>";
+    s += "</b> (safety limit ";
+    append_mmss(s, sleep_manual_failsafe_ms());
+    s += ") - nothing is sent, do not cut the 12V supply<br>";
   } else if (NVROLstateMachine == 7) {
     static const char* stage_names[4] = {"C3 (BAT TEMPO LEVEL)", "C2 (CUT OFF PENDING)", "C0 (SLEEPING)",
                                           "00"};
@@ -1684,12 +1855,56 @@ String RenaultTwingoGen1Battery::get_uds_info_html() {
              "Energy Regenerated: " << battery_energy_regenerated_kWh << " kWh<br>"
              "Temporisation (0x9281): " << temporisation_text(battery_temporisation) << "<br>";
   // clang-format on
+
+  // NVROL/Sleep settings: 0x9281 write value and B009 diagnostic session type (each an exclusive pair of
+  // checkboxes - clicking one always forces the other off), plus the manual sleep failsafe window.
+  // Persisted to NVM, same pattern as the BYD Atto3 auto-calibrate settings.
+  {
+    bool write0 = (datalayer_extended.twingoGen1.nvrol_temporisation_write_value == 0);
+    bool prog = datalayer_extended.twingoGen1.nvrol_b009_use_programming_session;
+    content += "<h4>0x9281 write value (NVROL reset + Sleep 0x9281=1): "
+               "<input type='checkbox' id='twingoWrite00' onclick='twingoSetWriteValue(0)' ";
+    content += write0 ? "checked>" : ">";
+    content += " 0x00 (activated) "
+               "<input type='checkbox' id='twingoWrite01' onclick='twingoSetWriteValue(1)' ";
+    content += write0 ? ">" : "checked>";
+    content += " 0x01</h4>";
+
+    content += "<h4>B009 diagnostic session: "
+               "<input type='checkbox' id='twingoB009Ext' onclick='twingoSetB009Session(0)' ";
+    content += prog ? ">" : "checked>";
+    content += " Extended (0x03) "
+               "<input type='checkbox' id='twingoB009Prog' onclick='twingoSetB009Session(1)' ";
+    content += prog ? "checked>" : ">";
+    content += " Programming (0x02)</h4>";
+
+    content += "<h4>Sleep failsafe (auto wake after): "
+               "<input type='number' id='twingoSleepMinutes' min='1' max='1440' value='";
+    content += String(datalayer_extended.twingoGen1.sleep_failsafe_minutes);
+    content += "'> min <button onclick='twingoSetSleepMinutes()'>Set</button></h4>";
+
+    content += "<script>";
+    content += "function twingoSetWriteValue(v){";
+    content += "document.getElementById('twingoWrite00').checked=(v===0);";
+    content += "document.getElementById('twingoWrite01').checked=(v===1);";
+    content += "var x=new XMLHttpRequest();x.open('GET','/editTwingoNvrolWriteValue?value='+v,true);x.send();}";
+    content += "function twingoSetB009Session(p){";
+    content += "document.getElementById('twingoB009Ext').checked=(p===0);";
+    content += "document.getElementById('twingoB009Prog').checked=(p===1);";
+    content += "var x=new XMLHttpRequest();x.open('GET','/editTwingoB009Session?value='+p,true);x.send();}";
+    content += "function twingoSetSleepMinutes(){";
+    content += "var m=document.getElementById('twingoSleepMinutes').value;";
+    content += "var x=new XMLHttpRequest();x.open('GET','/editTwingoSleepMinutes?value='+m,true);x.send();}";
+    content += "</script>";
+  }
+
   append_live_html(content);
   // clang-format off
   content << "NVROL Log - Session1: " << nvrol_log[0] << "<br>"
              "NVROL Log - Routine B009: " << nvrol_log[1] << "<br>"
+             "NVROL Log - Routine B009 results: " << nvrol_log[5] << "<br>"
              "NVROL Log - Session2: " << nvrol_log[2] << "<br>"
-             "NVROL Log - Write 9281=1: " << nvrol_log[3] << "<br>"
+             "NVROL Log - Write 9281=0 (activated): " << nvrol_log[3] << "<br>"
              "NVROL Log - Read back 0x9281: " << nvrol_log[4] << "<br>"
              "Temporisation right after the write (read back): " << temporisation_text(temporisation_readback) << "<br>";
   // clang-format on

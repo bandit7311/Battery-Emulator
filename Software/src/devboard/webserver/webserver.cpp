@@ -193,6 +193,22 @@ void def_route_with_auth(const char* uri, AsyncWebServer& serv, WebRequestMethod
 }
 
 void init_webserver() {
+  // Load persisted Twingo NVROL/Sleep settings (0x9281 write value, B009 session type, sleep failsafe
+  // minutes). Read-only open; falls back to the DataLayerExtended constructor's defaults (0x00, Extended,
+  // 30 min) for any key that has never been written yet.
+  {
+    Preferences prefs;
+    if (prefs.begin("batterySettings", true)) {
+      datalayer_extended.twingoGen1.nvrol_temporisation_write_value =
+          (uint8_t)prefs.getUInt("TWINGOWRVAL", datalayer_extended.twingoGen1.nvrol_temporisation_write_value);
+      datalayer_extended.twingoGen1.nvrol_b009_use_programming_session =
+          prefs.getBool("TWINGOB009PR", datalayer_extended.twingoGen1.nvrol_b009_use_programming_session);
+      datalayer_extended.twingoGen1.sleep_failsafe_minutes =
+          (uint16_t)prefs.getUInt("TWINGOSLPMIN", datalayer_extended.twingoGen1.sleep_failsafe_minutes);
+      prefs.end();
+    }
+  }
+
   if (webserver_auth_is_ready()) {
     web_auth_middleware.setUsername(http_username.c_str());
     web_auth_middleware.setPassword(http_password.c_str());
@@ -699,6 +715,45 @@ void init_webserver() {
   // Route for editing AH Calibration BYD
   update_string_setting("/editCalTargetAH", [](String value) {
     datalayer_extended.bydAtto3.calibrationTargetAH = static_cast<uint16_t>(value.toFloat());
+  });
+
+  // Twingo NVROL/Sleep settings ("More Battery Info" checkboxes/number field), persisted to NVM.
+  def_route_with_auth("/editTwingoNvrolWriteValue", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("value")) {
+      uint8_t value = (request->getParam("value")->value().toInt() != 0) ? 1 : 0;
+      datalayer_extended.twingoGen1.nvrol_temporisation_write_value = value;
+      Preferences prefs;
+      prefs.begin("batterySettings", false);
+      prefs.putUInt("TWINGOWRVAL", value);
+      prefs.end();
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  def_route_with_auth("/editTwingoB009Session", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("value")) {
+      bool programming = request->getParam("value")->value().toInt() != 0;
+      datalayer_extended.twingoGen1.nvrol_b009_use_programming_session = programming;
+      Preferences prefs;
+      prefs.begin("batterySettings", false);
+      prefs.putBool("TWINGOB009PR", programming);
+      prefs.end();
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  def_route_with_auth("/editTwingoSleepMinutes", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("value")) {
+      int value = request->getParam("value")->value().toInt();
+      if (value >= 1 && value <= 1440) {
+        datalayer_extended.twingoGen1.sleep_failsafe_minutes = (uint16_t)value;
+        Preferences prefs;
+        prefs.begin("batterySettings", false);
+        prefs.putUInt("TWINGOSLPMIN", (uint16_t)value);
+        prefs.end();
+      }
+    }
+    request->send(200, "text/plain", "OK");
   });
 
   // Isolation monitor control (RoutineControl 0x2008). One setting, applied to both batteries.

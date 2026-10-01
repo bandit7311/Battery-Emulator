@@ -315,11 +315,58 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   static const uint16_t EXT_POLL_TIME = 0x9261;
   static const uint16_t EXT_POLL_PACK_TIME = 0x91C1;
 
+  // Display-only PIDs found in real "RBMS_MCPU_RL" ECU dumps/DDT screenshots of two other Twingo/Zoe-family
+  // packs (28.09.2026), formulas confirmed against the tool's own decoded display value for each:
+  //   0x91CF Pack Mileage:            (raw ^ 0x80000000) / 32.0                    -> km
+  //   0x925F Vehicle Distance Totalizer: raw * 0.01                                -> km (belongs to the
+  //          vehicle, not the pack - kept running across a pack swap in the real dumps)
+  //   0x9011 Low Voltage Supply:      raw / 1024.0                                 -> V (tool's own label)
+  //   0x9006 Sum of all Cell Voltage: raw * 0.976563 / 1000 (same per-cell factor as 0x9021 etc.) -> V
+  //   0x9007 / 0x9009: two more single-cell voltage PIDs, same factor as 0x9006's per-cell part; the
+  //          numbers matched a Min/Max Cell Voltage screen, but the screenshot did not label which PID is
+  //          which - shown as "Cell Voltage A/B", not asserted as min/max.
+  //   0x9008 / 0x900A: the two PIDs above's "number of" cell index counterparts - raw byte, no scaling.
+  //   0x9003 Battery SOH:             raw / 100.0                                  -> %
+  //   0x9018 / 0x900E / 0x900F: Max Charge/Generated/Available Power (after restriction) -> raw / 100.0 kW
+  //   0x9001 Battery SOC (internal):  raw * 0.01 - 3.0                             -> % (BMS-internal scale)
+  //   0x9002 Battery USOC:            raw * 0.01                                   -> % (the SOC shown to
+  //          the driver - NOT fed to the datalayer/inverter here, display only)
+  //   0x91B9 / 0x91BA: SOC min/max, same formula as 0x9001
+  static const uint16_t EXT_POLL_MILEAGE_PACK = 0x91CF;
+  static const uint16_t EXT_POLL_MILEAGE_VEHICLE = 0x925F;
+  static const uint16_t EXT_POLL_LV_SUPPLY = 0x9011;
+  static const uint16_t EXT_POLL_PACK_VOLTAGE = 0x9006;
+  static const uint16_t EXT_POLL_CELL_V_A = 0x9007;
+  static const uint16_t EXT_POLL_CELL_V_B = 0x9009;
+  static const uint16_t EXT_POLL_CELL_V_A_NR = 0x9008;
+  static const uint16_t EXT_POLL_CELL_V_B_NR = 0x900A;
+  static const uint16_t EXT_POLL_SOH_AVG = 0x9003;
+  static const uint16_t EXT_POLL_MAX_CHARGE_POWER = 0x9018;
+  static const uint16_t EXT_POLL_MAX_GEN_POWER = 0x900E;
+  static const uint16_t EXT_POLL_MAX_AVAIL_POWER = 0x900F;
+  static const uint16_t EXT_POLL_SOC_AVG = 0x9001;
+  static const uint16_t EXT_POLL_USOC_AVG = 0x9002;
+  static const uint16_t EXT_POLL_SOC_MIN = 0x91B9;
+  static const uint16_t EXT_POLL_SOC_MAX = 0x91BA;
+
+  // One raw value + "have we ever read it" flag per PID above. Kept as plain uint32_t (never negative for
+  // any of these PIDs) so one small struct and one switch-case body covers every one of them.
+  struct ExtValue {
+    uint32_t raw = 0;
+    bool valid = false;
+  };
+  ExtValue ext_mileage_pack, ext_mileage_vehicle, ext_lv_supply, ext_pack_voltage, ext_cell_v_a, ext_cell_v_b,
+      ext_cell_v_a_nr, ext_cell_v_b_nr, ext_soh_avg, ext_max_charge_power, ext_max_gen_power,
+      ext_max_avail_power, ext_soc_avg, ext_usoc_avg, ext_soc_min, ext_soc_max;
+  // One line for a display-only ExtValue: "label: value unit<br>" or "label: not yet read<br>".
+  static void append_ext_value(String& s, const char* label, const ExtValue& v, double value, const char* unit);
+
   // 96 cell-voltage PIDs (0x9021-0x9083, skipping 0x9040/0x9060/0x9080) + the
   // 6 PIDs above + the 8 pack temperature PIDs + BMS state + 4 balancing counters
-  // + 2 balancing counters while awake + 2 time PIDs = 119 poll targets, cycled continuously, one every
-  // 200ms (same cadence as Battery-Emulator's own Zoe Ph2 driver) -> ~23.8s/cycle.
-  static const uint8_t EXT_POLL_LIST_LENGTH = 119;
+  // + 2 balancing counters while awake + 2 time PIDs + 16 display-only PIDs (mileage/voltage/SOC/SOH/power,
+  // see the comment above) = 135 poll targets, cycled continuously, one every
+  // 200ms (same cadence as Battery-Emulator's own Zoe Ph2 driver) -> ~27.0s/cycle.
+  static const uint8_t EXT_POLL_LIST_LENGTH = 135;
   const uint16_t ext_poll_list[EXT_POLL_LIST_LENGTH] = {
       0x9021, 0x9022, 0x9023, 0x9024, 0x9025, 0x9026, 0x9027, 0x9028,
       0x9029, 0x902A, 0x902B, 0x902C, 0x902D, 0x902E, 0x902F, 0x9030,
@@ -342,7 +389,12 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
       EXT_POLL_BMS_STATE, EXT_POLL_BAL_CAP_TOTAL, EXT_POLL_BAL_TIME_TOTAL, EXT_POLL_BAL_CAP_SLEEP,
       EXT_POLL_BAL_TIME_SLEEP, EXT_POLL_BAL_CAP_WAKE, EXT_POLL_BAL_TIME_WAKE,
       // Time PIDs (raw display only)
-      EXT_POLL_TIME, EXT_POLL_PACK_TIME};
+      EXT_POLL_TIME, EXT_POLL_PACK_TIME,
+      // Display-only PIDs from the real "RBMS_MCPU_RL" dumps (28.09.), see the comment above
+      EXT_POLL_MILEAGE_PACK, EXT_POLL_MILEAGE_VEHICLE, EXT_POLL_LV_SUPPLY, EXT_POLL_PACK_VOLTAGE,
+      EXT_POLL_CELL_V_A, EXT_POLL_CELL_V_B, EXT_POLL_CELL_V_A_NR, EXT_POLL_CELL_V_B_NR, EXT_POLL_SOH_AVG,
+      EXT_POLL_MAX_CHARGE_POWER, EXT_POLL_MAX_GEN_POWER, EXT_POLL_MAX_AVAIL_POWER, EXT_POLL_SOC_AVG,
+      EXT_POLL_USOC_AVG, EXT_POLL_SOC_MIN, EXT_POLL_SOC_MAX};
 
   uint8_t ext_poll_index = 0;
   unsigned long previousMillisExtPoll = 0;
@@ -436,7 +488,10 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   uint8_t nvrol_mode = 0;
   uint8_t nvrol_last_mode = 0;  // mode of the last finished run, for the display
   bool nvrol_wake_request = false;
-  static const unsigned long SLEEP_MANUAL_FAILSAFE_MS = 30UL * 60UL * 1000UL;  // wakes up on its own after 30 min
+  // Default/fallback if the configured value (datalayer_extended.twingoGen1.sleep_failsafe_minutes,
+  // settable via "More Battery Info") is ever 0 or otherwise implausible.
+  static const unsigned long SLEEP_MANUAL_FAILSAFE_DEFAULT_MIN = 30;
+  unsigned long sleep_manual_failsafe_ms(void);  // reads the configured minutes, clamped, *60000
   void start_nvrol_run(uint8_t mode) {
     if (!UserRequestNVROLReset) {
       nvrol_mode = mode;
@@ -482,9 +537,12 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   // 9281), shown on "More Battery Info" - lets us see whether each step was
   // accepted, actively rejected (with the BMS's own SID/NRC code), or never
   // answered at all, instead of sending blind like the first attempt.
-  static const uint8_t NVROL_LOG_STEPS = 5;  // index 4 = 0x9281 read back right after the write
+  // index 4 = 0x9281 read back right after the write, index 5 = RoutineControl B009 RequestRoutineResults
+  // (subfunction 0x03), sent after starting B009 to see what the routine itself reports, instead of only
+  // inferring success from the 0x9281 read-back.
+  static const uint8_t NVROL_LOG_STEPS = 6;
   char nvrol_log[NVROL_LOG_STEPS][48] = {"not run yet", "not run yet", "not run yet", "not run yet",
-                                         "not run yet"};
+                                         "not run yet", "not run yet"};
   uint16_t temporisation_readback = 0x100;  // raw byte of 0x9281 read right after the write, 0x100 = none
   uint8_t nvrol_awaiting_step = 0;  // Which nvrol_log[] slot the next 0x18DAF1DB reply belongs to
   void handle_nvrol_reply(CAN_frame rx_frame);

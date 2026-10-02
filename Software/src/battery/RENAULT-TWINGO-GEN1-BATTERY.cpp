@@ -187,6 +187,28 @@ uint16_t RenaultTwingoGen1Battery::handle_pid(uint16_t pid, uint32_t value, cons
 // Single-frame reply (fits in one CAN frame): `data`/`length` point at the
 // payload bytes after the echoed SID+PID.
 void RenaultTwingoGen1Battery::handle_extended_single_frame(uint16_t pid, const uint8_t* data, uint16_t length) {
+  // A DTC Read is in flight and this single-frame reply isn't a normal PID response at all: for a
+  // positive ReadDTCInformation reply, byte[1]=SID(0x59), byte[2]=subfunction(0x02), byte[3]=mask(0x09)
+  // - which the generic caller already reinterprets as "pid", high byte 0x02, coincidentally never a
+  // real PID. 01.10. real captured reply: byte[3] (the DTCStatusAvailabilityMask the ECU reports it
+  // supports) came back 0xFF, NOT an echo of the 0x09 we requested - per the UDS 0x19/0x02 spec this
+  // byte is the ECU's own supported-status mask, not a request echo, so only the subfunction byte
+  // (pid's high byte, 0x02) is checked now, not the full 0x0209 - the exact-match version silently
+  // dropped a fully, correctly reassembled reply because of this.
+  // For a negative response, byte[1]=0x7F, byte[2]=<requested SID>=0x19, byte[3]=NRC - so pid's high
+  // byte is 0x19. Both are handled here instead of falling through to the PID switch below.
+  if (dtc_ext_state == DTC_EXT_READ_CMD_SENT) {
+    if ((pid >> 8) == 0x19) {
+      snprintf(dtc_ext_log_read, sizeof(dtc_ext_log_read), "NEGATIVE SID=0x19 NRC=0x%02X", pid & 0xFF);
+      ZOE_POLL_18DADBF1.data = {0x03, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};  // restore poll template
+      dtc_ext_state = DTC_EXT_IDLE;
+      return;
+    }
+    if ((pid >> 8) == 0x02) {
+      handle_dtc_read_response(data, length);
+      return;
+    }
+  }
   if (pid >= 0x9021 && pid <= 0x9083) {
     // Individual cell voltage. Three offsets (0x9040/0x9060/0x9080) are
     // skipped in the BMS's own PID numbering; account for that. Verified
@@ -447,6 +469,17 @@ void RenaultTwingoGen1Battery::handle_extended_multiframe_complete() {
     return;  // Not even enough for an echoed SID+PID
   }
   uint16_t pid = (ext_isotp_buffer[1] << 8) | ext_isotp_buffer[2];
+  if ((pid >> 8) == 0x02 && dtc_ext_state == DTC_EXT_READ_CMD_SENT) {
+    // Positive ReadDTCInformation reply that needed multiple frames (more than ~1 DTC worth of data) -
+    // buffer[0]=SID(0x59), [1]=subfunction(0x02), [2]=DTCStatusAvailabilityMask, [3..]=DTC entries
+    // (3-byte code + 1-byte status each). This is the case actually confirmed on this battery (01.10.
+    // capture): First Frame + our Flow Control + 3 Consecutive Frames reassembled cleanly to the full
+    // 27 bytes the First Frame announced - but buffer[2] (the ECU's reported supported-status mask) came
+    // back 0xFF, not an echo of the 0x09 we requested, so only the subfunction byte is checked here now,
+    // not the full previous pid==0x0209 (that exact-match version silently dropped this exact reply).
+    handle_dtc_read_response(&ext_isotp_buffer[3], (uint16_t)(ext_isotp_received_len - 3));
+    return;
+  }
   if (pid == EXT_POLL_BMS_STATE) {
     // 0x9270: 32 bytes after SID+PID (35 bytes in total)
     if (ext_isotp_received_len >= 3 + 32) {
@@ -1563,10 +1596,15 @@ void RenaultTwingoGen1Battery::handle_incoming_can_frame(CAN_frame rx_frame) {
         // ReadDataByIdentifier ones - handle_extended_reply() would
         // misparse them (it assumes a PID sits at bytes 2-3).
         handle_nvrol_reply(rx_frame);
-      } else if (dtc_ext_state == DTC_EXT_READ_CMD_SENT || dtc_ext_state == DTC_EXT_ERASE_CMD_SENT) {
-        // Same reasoning as above: a DTC Read/Erase reply isn't a ReadDataByIdentifier reply either.
+      } else if (dtc_ext_state == DTC_EXT_ERASE_CMD_SENT) {
+        // Erase replies are always tiny (positive "54" / negative "7F 14 NRC"), never multi-frame -
+        // the simple dedicated handler is enough, no need for the generic reassembly machinery.
         handle_dtc_ext_reply(rx_frame);
       } else {
+        // Covers normal PID polls AND DTC Read replies (dtc_ext_state == DTC_EXT_READ_CMD_SENT): a
+        // DTC Read reply can be multi-frame (confirmed 01.10. on this battery), so it needs the
+        // generic reassembly path's flow-control handling - handle_extended_single_frame() and
+        // handle_extended_multiframe_complete() both recognize and redirect it (see their DTC checks).
         handle_extended_reply(rx_frame);
       }
       break;
@@ -1692,6 +1730,45 @@ void RenaultTwingoGen1Battery::send_fast_frames(unsigned long currentMillis) {
     transmit_can_frame(&TWINGO_242_FAST);
   }
 }
+
+// Simulates the real EVC<->LBC 10ms heartbeat pair (0x1F8/0x18A) that a real vehicle sends but this
+// standalone emulator never did until now (see datalayer_extended.twingoGen1.evc_heartbeat_enabled,
+// off by default - toggle on /advanced, NVM-persisted). Content otherwise verbatim from a real log
+// capture; only 0x1F8 byte 5 and 0x18A byte 7 (rolling counter) are computed here each send.
+void RenaultTwingoGen1Battery::send_evc_heartbeat(unsigned long currentMillis) {
+  if (!datalayer_extended.twingoGen1.evc_heartbeat_enabled) {
+    return;
+  }
+#ifdef TWINGO_EXTENDED_CELL_POLLING
+  if (NVROLstateMachine == 7 && powerdown_stage >= 2) {
+    return;  // same silence rule as send_fast_frames() - C0/00 stage of shutdown, true silence in 5/8
+  }
+  if (NVROLstateMachine == 8 && wake_burst_index == 0) {
+    return;
+  }
+#endif
+  if (currentMillis - previousMillis_evc_heartbeat < INTERVAL_10_MS) {
+    return;
+  }
+  previousMillis_evc_heartbeat = currentMillis;
+
+  // Relay/contactor status byte, coupled to the sleep state machine (see 01.10. real-log analysis: the
+  // real vehicle's 0x1F8 byte 5 went FA->00 right as the contactors closed) - 0x00 "closed" whenever
+  // awake or mid-NVROL-sequence, 0xFA "open" only while the shutdown is announced or the pack is silent.
+#ifdef TWINGO_EXTENDED_CELL_POLLING
+  const bool relays_virtually_open = (NVROLstateMachine == 5 || NVROLstateMachine == 7);
+#else
+  const bool relays_virtually_open = false;
+#endif
+  TWINGO_1F8_HEARTBEAT.data.u8[5] = relays_virtually_open ? 0xFA : 0x00;
+  transmit_can_frame(&TWINGO_1F8_HEARTBEAT);
+
+  // Rolling counter, byte 7: observed real sequence 0x70,0x80,...,0xF0,0x00,0x10,... (steps of 0x10,
+  // wraps at 0x100). evc_heartbeat_18a_counter holds the current nibble (0x07 start -> 0x70 first byte).
+  evc_heartbeat_18a_counter = (uint8_t)((evc_heartbeat_18a_counter + 1) & 0x0F);
+  TWINGO_18A_HEARTBEAT_RESPONSE.data.u8[7] = (uint8_t)(evc_heartbeat_18a_counter << 4);
+  transmit_can_frame(&TWINGO_18A_HEARTBEAT_RESPONSE);
+}
 #endif  // TWINGO_FAST_VEHICLE_FRAMES
 
 void RenaultTwingoGen1Battery::transmit_can(unsigned long currentMillis) {
@@ -1781,7 +1858,8 @@ void RenaultTwingoGen1Battery::transmit_can(unsigned long currentMillis) {
   }
 
 #ifdef TWINGO_FAST_VEHICLE_FRAMES
-  send_fast_frames(currentMillis);  // 0x090 every 10 ms, 0x242 every 20 ms
+  send_fast_frames(currentMillis);     // 0x090 every 10 ms, 0x242 every 20 ms
+  send_evc_heartbeat(currentMillis);   // 0x1F8/0x18A every 10 ms, if enabled (see /advanced)
 #endif
   }  // !suppress_own_broadcast
 
@@ -1797,7 +1875,17 @@ void RenaultTwingoGen1Battery::transmit_can(unsigned long currentMillis) {
   // temperatures + BMS state + 6 balancing counters + 2 time PIDs), one every 200ms (same
   // cadence as Battery-Emulator's own Zoe Ph2 driver) -> ~23.8s per full cycle.
   // Right after the NVROL quiet phase a few PIDs are asked first, see ext_priority_list.
-  if (datalayer_extended.twingoGen1.cellwatch_enabled) {
+  //
+  // Paused entirely (not just Cellwatch) while a DTC exchange is in flight (dtc_ext_state != IDLE):
+  // 01.10. bug found - round-robin/Cellwatch kept sending their own unrelated requests on the same
+  // CAN ID while a DTC multi-frame reply was still being reassembled. A normal single-frame poll
+  // response in between Consecutive Frames would set ext_isotp_in_progress = false (see
+  // handle_extended_reply), silently aborting the DTC reassembly already in progress - matches a
+  // real-world "no response" result that followed a successful "unexpected multi-frame" one. Same
+  // "pausieren, nicht verzahnen" principle as Cellwatch, just gated on dtc_ext_state too now.
+  if (dtc_ext_state != DTC_EXT_IDLE) {
+    // Nothing to do here - handle_dtc_ext() above drives the whole exchange by itself.
+  } else if (datalayer_extended.twingoGen1.cellwatch_enabled) {
     // Cellwatch active: the normal round-robin is fully paused - previousMillisExtPoll/ext_poll_index
     // are simply never touched here, so it resumes from exactly where it left off once Cellwatch is
     // turned off again (Variante 1: pausieren, nicht verzahnen). Only the selected cell is requested,
@@ -1812,6 +1900,12 @@ void RenaultTwingoGen1Battery::transmit_can(unsigned long currentMillis) {
         cell = 96;
       }
       uint16_t pid = ext_poll_list[cell - 1];  // cell 1..96 -> the first 96 entries, in order
+      // Bytes 0/1 (PCI/SID) set explicitly every time, not assumed left over from the previous send -
+      // ZOE_POLL_18DADBF1 is a shared frame object; DTC Read/Erase (or any future sequence) can leave
+      // it on a different SID (see handle_dtc_ext's bug fix comment), which would otherwise silently
+      // corrupt every poll after it.
+      ZOE_POLL_18DADBF1.data.u8[0] = 0x03;
+      ZOE_POLL_18DADBF1.data.u8[1] = 0x22;
       ZOE_POLL_18DADBF1.data.u8[2] = (uint8_t)((pid >> 8) & 0xFF);
       ZOE_POLL_18DADBF1.data.u8[3] = (uint8_t)(pid & 0xFF);
       transmit_can_frame(&ZOE_POLL_18DADBF1);
@@ -1839,6 +1933,8 @@ void RenaultTwingoGen1Battery::transmit_can(unsigned long currentMillis) {
       pid = ext_poll_list[ext_poll_index];
       ext_poll_index = (ext_poll_index + 1) % EXT_POLL_LIST_LENGTH;
     }
+    ZOE_POLL_18DADBF1.data.u8[0] = 0x03;  // see the matching comment in the Cellwatch branch above
+    ZOE_POLL_18DADBF1.data.u8[1] = 0x22;
     ZOE_POLL_18DADBF1.data.u8[2] = (uint8_t)((pid >> 8) & 0xFF);
     ZOE_POLL_18DADBF1.data.u8[3] = (uint8_t)(pid & 0xFF);
     transmit_can_frame(&ZOE_POLL_18DADBF1);
@@ -1936,6 +2032,11 @@ String RenaultTwingoGen1Battery::get_uds_info_html() {
         "<button onclick=\"window.open('/cellwatch','_blank')\">Open Cellwatch page</button>"
         " - pauses the normal cell round-robin while enabled</h4>";
 
+    content += "<h4>EVC heartbeat (0x1F8/0x18A, 10ms, relay-status byte coupled to sleep state): "
+               "<input type='checkbox' id='twingoEvcHeartbeat' onclick='twingoSetEvcHeartbeat(this.checked)' ";
+    content += datalayer_extended.twingoGen1.evc_heartbeat_enabled ? "checked>" : ">";
+    content += " enable</h4>";
+
     content += "<script>";
     content += "function twingoSetWriteValue(v){";
     content += "document.getElementById('twingoWrite00').checked=(v===0);";
@@ -1953,6 +2054,8 @@ String RenaultTwingoGen1Battery::get_uds_info_html() {
     content += "function twingoSetCellwatchCell(){";
     content += "var c=document.getElementById('twingoCellwatchCell').value;";
     content += "var x=new XMLHttpRequest();x.open('GET','/editTwingoCellwatchCell?value='+c,true);x.send();}";
+    content += "function twingoSetEvcHeartbeat(v){";
+    content += "var x=new XMLHttpRequest();x.open('GET','/editTwingoEvcHeartbeat?value='+(v?1:0),true);x.send();}";
     content += "</script>";
   }
 
@@ -2066,6 +2169,7 @@ void RenaultTwingoGen1Battery::handle_dtc_ext(unsigned long currentMillis) {
       if (currentMillis - dtc_ext_step_start_ms >= DTC_EXT_REPLY_TIMEOUT_MS) {
         strncpy(dtc_ext_log_read, "no response", sizeof(dtc_ext_log_read) - 1);
         dtc_ext_log_read[sizeof(dtc_ext_log_read) - 1] = '\0';
+        ZOE_POLL_18DADBF1.data = {0x03, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};  // restore poll template
         dtc_ext_state = DTC_EXT_IDLE;
       }
       break;
@@ -2084,16 +2188,55 @@ void RenaultTwingoGen1Battery::handle_dtc_ext(unsigned long currentMillis) {
       if (currentMillis - dtc_ext_step_start_ms >= DTC_EXT_REPLY_TIMEOUT_MS) {
         strncpy(dtc_ext_log_erase, "no response", sizeof(dtc_ext_log_erase) - 1);
         dtc_ext_log_erase[sizeof(dtc_ext_log_erase) - 1] = '\0';
+        ZOE_POLL_18DADBF1.data = {0x03, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};  // restore poll template
         dtc_ext_state = DTC_EXT_IDLE;
       }
       break;
   }
 }
 
+// Called once a positive ReadDTCInformation reply has been fully received (single- or multi-frame,
+// see the two call sites above) - data/len already point past SID+subfunction+mask, i.e. straight at
+// the repeated 4-byte DTC entries (3-byte code + 1-byte status), same layout UdsCanBattery's own
+// (private, so not reusable from here) handle_dtc_response() expects for the non-KWP2000 case. Feeds
+// the SAME `dtc` structure the existing "Diagnostic Trouble Codes" table on /advanced already renders
+// (DTC/Status columns; Description stays "Unknown" - no renault_zoe_gen1_dtc.json exists, see 01.10.
+// research) - this is the first time that table gets real data instead of "Not read yet".
+void RenaultTwingoGen1Battery::handle_dtc_read_response(const uint8_t* data, uint16_t len) {
+  if (dtc != nullptr) {
+    int count = len / 4;
+    if (count > dtc->MAX_DTC_COUNT) {
+      count = dtc->MAX_DTC_COUNT;
+    }
+    if (count < 0) {
+      count = 0;
+    }
+    for (int i = 0; i < count; i++) {
+      uint16_t offset = (uint16_t)(i * 4);
+      if ((uint16_t)(offset + 3) >= len) {
+        break;
+      }
+      dtc->dtc_codes[i] = ((uint32_t)data[offset] << 16) | ((uint32_t)data[offset + 1] << 8) |
+                          (uint32_t)data[offset + 2];
+      dtc->dtc_status[i] = data[offset + 3];
+    }
+    dtc->dtc_count = (uint8_t)count;
+    dtc->dtc_reported_count = (uint16_t)(len / 4);  // may exceed dtc_count if truncated at MAX_DTC_COUNT
+    dtc->dtc_read_failed = false;
+    dtc->dtc_last_read_millis = millis();
+  }
+  snprintf(dtc_ext_log_read, sizeof(dtc_ext_log_read), "OK, %u DTC(s), %u bytes raw", (unsigned)(len / 4),
+           (unsigned)len);
+  ZOE_POLL_18DADBF1.data = {0x03, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};  // restore poll template
+  dtc_ext_state = DTC_EXT_IDLE;
+}
+
 // Logs whatever came back, verbatim - same format as handle_nvrol_reply() (OK raw=.. / NEGATIVE SID=../
 // short reply / unexpected multi-frame), reused here since the two state machines never run at once.
+// Only used for Erase replies now (always tiny: "54" positive / "7F 14 NRC" negative, both single-frame
+// - Read replies are handled by handle_dtc_read_response() above via the generic reassembly path).
 void RenaultTwingoGen1Battery::handle_dtc_ext_reply(CAN_frame rx_frame) {
-  char* log = (dtc_ext_state == DTC_EXT_READ_CMD_SENT) ? dtc_ext_log_read : dtc_ext_log_erase;
+  char* log = dtc_ext_log_erase;  // only Erase routes here now, see the dispatch comment above
   uint8_t pci = rx_frame.data.u8[0];
   if (pci >= 0x10) {
     snprintf(log, 48, "unexpected multi-frame (PCI=0x%02X)", pci);
@@ -2106,5 +2249,6 @@ void RenaultTwingoGen1Battery::handle_dtc_ext_reply(CAN_frame rx_frame) {
              rx_frame.data.u8[3], rx_frame.data.u8[4], rx_frame.data.u8[5], rx_frame.data.u8[6],
              rx_frame.data.u8[7]);
   }
+  ZOE_POLL_18DADBF1.data = {0x03, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};  // restore poll template
   dtc_ext_state = DTC_EXT_IDLE;  // reply seen - no need to wait out the timeout
 }

@@ -206,6 +206,8 @@ void init_webserver() {
           prefs.getBool("TWINGOB009PR", datalayer_extended.twingoGen1.nvrol_b009_use_programming_session);
       datalayer_extended.twingoGen1.sleep_failsafe_minutes =
           (uint16_t)prefs.getUInt("TWINGOSLPMIN", datalayer_extended.twingoGen1.sleep_failsafe_minutes);
+      datalayer_extended.twingoGen1.evc_heartbeat_enabled =
+          prefs.getBool("TWINGOEVCHB", datalayer_extended.twingoGen1.evc_heartbeat_enabled);
       prefs.end();
     }
   }
@@ -753,6 +755,20 @@ void init_webserver() {
         prefs.putUInt("TWINGOSLPMIN", (uint16_t)value);
         prefs.end();
       }
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  // EVC heartbeat simulation (0x1F8/0x18A, see datalayer_extended.h) - unlike Cellwatch, persisted to
+  // NVM on explicit user request, so a chosen test configuration survives a reboot.
+  def_route_with_auth("/editTwingoEvcHeartbeat", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("value")) {
+      bool enable = request->getParam("value")->value().toInt() != 0;
+      datalayer_extended.twingoGen1.evc_heartbeat_enabled = enable;
+      Preferences prefs;
+      prefs.begin("batterySettings", false);
+      prefs.putBool("TWINGOEVCHB", enable);
+      prefs.end();
     }
     request->send(200, "text/plain", "OK");
   });

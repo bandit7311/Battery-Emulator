@@ -169,6 +169,25 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
                                    .ID = 0x69F,
                                    .data = {0x71, 0x30, 0x28, 0x2F}};
 
+  // EVC<->LBC 10ms heartbeat pair (see datalayer_extended.twingoGen1.evc_heartbeat_enabled) - content
+  // bytes taken verbatim from a real Log_Twingo_Ladung.log capture (01.10.), confirmed at ~9.5ms/~9.5ms
+  // real-world cadence. 0x1F8 byte 5 is rewritten each send to the awake/shutdown value, see
+  // send_evc_heartbeat(); the rest of both frames stays exactly as captured - unverified beyond that
+  // (e.g. 0x18A byte 6 varies in the real log, looks like a checksum, but the algorithm is unknown, so
+  // it is left at the first-seen value here rather than guessed).
+  CAN_frame TWINGO_1F8_HEARTBEAT = {.FD = false,
+                                    .ext_ID = false,
+                                    .DLC = 8,
+                                    .ID = 0x1F8,
+                                    .data = {0x00, 0x84, 0xFF, 0xFF, 0xFE, 0x00, 0x00, 0x0F}};
+  CAN_frame TWINGO_18A_HEARTBEAT_RESPONSE = {.FD = false,
+                                             .ext_ID = false,
+                                             .DLC = 8,
+                                             .ID = 0x18A,
+                                             .data = {0xFF, 0xF0, 0x00, 0x06, 0x40, 0x3C, 0xD5, 0x70}};
+  unsigned long previousMillis_evc_heartbeat = 0;
+  uint8_t evc_heartbeat_18a_counter = 0x07;  // nibble index into the observed 0x70,0x80,...,0xF0,0x00... sequence
+
   // Experiment (only sent during the shutdown sequence's C3/C2 stages, see transmit_can()): 0x214 was
   // found in Log_Twingo_Ladung.log changing in lockstep with 0x350's own C3/C2 ("08 00") vs. C0/00/awake
   // ("F8 3E") states, only 0.03-0.19s after each transition - possibly the EVC's own wake/sleep request
@@ -234,6 +253,7 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   unsigned long previousMillis_090 = 0;
   unsigned long previousMillis_242 = 0;
   void send_fast_frames(unsigned long currentMillis);
+  void send_evc_heartbeat(unsigned long currentMillis);
 #endif
 
   // Boot plausibility filter for the temperatures of the 0x424 broadcast (BATTERY_OVERHEAT used to trigger
@@ -573,11 +593,16 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   uint8_t dtc_ext_state = DTC_EXT_IDLE;
   unsigned long dtc_ext_step_start_ms = 0;
   static const unsigned long DTC_EXT_SESSION_GAP_MS = 100;    // matches the NVROL sequence's own pacing
-  static const unsigned long DTC_EXT_REPLY_TIMEOUT_MS = 300;  // unverified - first probe, not a known-good value
+  // 01.10.: raised from 300ms after a real multi-frame response ("unexpected multi-frame (PCI=0x10)")
+  // was followed by "no response" on a later attempt - 300ms likely wasn't enough for First Frame +
+  // our Flow Control + all Consecutive Frames to complete; 2000ms is a safety margin, still unverified
+  // as a measured minimum, just large enough that a genuinely silent BMS still reports in reasonable time.
+  static const unsigned long DTC_EXT_REPLY_TIMEOUT_MS = 2000;
   char dtc_ext_log_read[48] = "not run yet";
   char dtc_ext_log_erase[48] = "not run yet";
   void handle_dtc_ext(unsigned long currentMillis);
   void handle_dtc_ext_reply(CAN_frame rx_frame);
+  void handle_dtc_read_response(const uint8_t* data, uint16_t len);
 
   // Quiet phase (NVROLstateMachine == 5). UserRequestNVROLReset stays true during the whole time.
   static const unsigned long NVROL_SILENCE_MS = 45000;

@@ -237,6 +237,14 @@ struct DATALAYER_INFO_TWINGO_GEN1 {
   uint16_t cellwatch_last_mV;         // last value received for cellwatch_cell
   uint32_t cellwatch_sample_count;    // successful samples since cellwatch was last turned on
   uint32_t cellwatch_last_sample_ms;  // millis() of the last received sample (0 = none yet)
+
+  /** Simulates the EVC-side 0x1F8/0x18A 10ms heartbeat pair that a real vehicle's EVC/LBC exchange,
+   *  confirmed present in a real Log_Twingo_Ladung.log capture (01.10.) but never sent by this emulator
+   *  (standalone battery, no real EVC). 0x1F8 byte 5 is coupled to NVROLstateMachine - 0x00 while awake,
+   *  0xFA while the shutdown/sleep sequence is announced or silent, matching the real log's FA->00
+   *  transition observed at the real vehicle's contactor-close moment. Settable on "More Battery Info",
+   *  persisted to NVM on explicit request (unlike Cellwatch) - the user wants reboot-stable testing. */
+  bool evc_heartbeat_enabled;
 };
 
 struct DATALAYER_INFO_CELLPOWER {

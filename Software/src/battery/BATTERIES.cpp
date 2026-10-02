@@ -222,7 +222,9 @@ const battery_chemistry_enum battery_chemistry_default = battery_chemistry_enum:
 battery_chemistry_enum user_selected_battery_chemistry = battery_chemistry_default;
 
 BatteryType user_selected_battery_type = BatteryType::None;
+BatteryType user_selected_battery_type_2 = BatteryType::None;
 bool user_selected_second_battery = false;
+bool user_selected_battery2_rx_only = false;
 bool user_selected_triple_battery = false;
 
 Battery* create_battery(BatteryType type) {
@@ -361,6 +363,7 @@ bool battery_supports_double(BatteryType type) {
     case BatteryType::Pylon:
     case BatteryType::SantaFePhev:
     case BatteryType::RelionBattery:
+    case BatteryType::RenaultKangoo:
     case BatteryType::RenaultTwingo1:
     case BatteryType::RenaultZoe1:
     case BatteryType::RenaultZoe2:
@@ -406,10 +409,10 @@ void setup_battery() {
   }
 
   if (user_selected_second_battery && !battery2) {
-    if (!battery_supports_double(user_selected_battery_type)) {
+    if (!battery_supports_double(user_selected_battery_type_2)) {
       DEBUG_PRINTF("User tried enabling double battery on non-supported integration!\n");
     } else {
-      switch (user_selected_battery_type) {
+      switch (user_selected_battery_type_2) {
         case BatteryType::BoltAmpera:
           battery2 =
               new BoltAmperaBattery(&datalayer.battery2, &datalayer_extended.boltampera_2, can_config.battery_double);
@@ -452,6 +455,10 @@ void setup_battery() {
         case BatteryType::RelionBattery:
           battery2 = new RelionBattery(&datalayer.battery2, can_config.battery_double,
                                        &datalayer.system.status.battery2_allowed_contactor_closing);
+          break;
+        case BatteryType::RenaultKangoo:
+          battery2 = new RenaultKangooBattery(&datalayer.battery2, can_config.battery_double,
+                                               user_selected_battery2_rx_only);
           break;
         case BatteryType::RenaultTwingo1:
           battery2 = new RenaultTwingoGen1Battery(&datalayer.battery2, can_config.battery_double);

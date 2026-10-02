@@ -70,7 +70,9 @@ extern const char* name_for_chemistry(battery_chemistry_enum chem);
 extern const char* name_for_comm_interface(comm_interface comm);
 
 extern BatteryType user_selected_battery_type;
+extern BatteryType user_selected_battery_type_2;
 extern bool user_selected_second_battery;
+extern bool user_selected_battery2_rx_only;
 extern bool user_selected_triple_battery;
 
 extern battery_chemistry_enum user_selected_battery_chemistry;

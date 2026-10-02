@@ -107,6 +107,8 @@ void init_stored_settings() {
   }
 
   user_selected_battery_type = (BatteryType)settings.getUInt("BATTTYPE", (int)BatteryType::None);
+  user_selected_battery_type_2 = (BatteryType)settings.getUInt("BATT2TYPE", (int)BatteryType::None);
+  user_selected_battery2_rx_only = settings.getBool("BATT2RXONLY", false);
   user_selected_battery_chemistry =
       (battery_chemistry_enum)settings.getUInt("BATTCHEM", (int)battery_chemistry_enum::NCA);
   user_selected_inverter_protocol = (InverterProtocolType)settings.getUInt("INVTYPE", (int)InverterProtocolType::None);

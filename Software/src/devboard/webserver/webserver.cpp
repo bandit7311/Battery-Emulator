@@ -432,6 +432,7 @@ void init_webserver() {
       "PYLONOFFSET",  "PYLONORDER",   "DEYEBYD",       "NCCONTACTOR", "TRIBTR",        "CNTCTRLTRI",   "ESPNOWENABLED",
       "PRIMOGEN24",   "CTINVERT",     "LOWPASSFILTER", "WEBAUTH",     "SLOWCANINV",    "CHGTAPERSOC",  "MEASURECPUTEMP",
       "SYSLOGEN",     "PERBMSDEFSOC", "PERBMSSKIPBAL", "INVOFFGRID",  "CHGESTIMATED",  "MQTTHEAP",     "HADISCFWU",
+      "BATT2RXONLY",
 #ifdef SDCARD
       "SDLOGENABLED", "CANLOGSD",
 #endif  // SDCARD
@@ -517,6 +518,9 @@ void init_webserver() {
                 } else if (p->name() == "EQSTOP") {
                   auto type = static_cast<STOP_BUTTON_BEHAVIOR>(atoi(p->value().c_str()));
                   settings.saveUInt("EQSTOP", (int)type);
+                } else if (p->name() == "BATT2TYPE") {
+                  auto type = static_cast<BatteryType>(atoi(p->value().c_str()));
+                  settings.saveUInt("BATT2TYPE", (int)type);
                 } else if (p->name() == "BATT2COMM") {
                   auto type = static_cast<comm_interface>(atoi(p->value().c_str()));
                   settings.saveUInt("BATT2COMM", (int)type);
@@ -592,6 +596,13 @@ void init_webserver() {
               }
               if (!battery_supports_triple(selectedBatteryType) && settings.getBool("TRIBTR", false)) {
                 settings.saveBool("TRIBTR", false);
+              }
+
+              // Same safety net for the independently selected battery 2 type: if it doesn't
+              // (or no longer) support being a second battery, don't leave DBLBTR enabled for it.
+              auto selectedBattery2Type = static_cast<BatteryType>(settings.getUInt("BATT2TYPE", (int)BatteryType::None));
+              if (!battery_supports_double(selectedBattery2Type) && settings.getBool("DBLBTR", false)) {
+                settings.saveBool("DBLBTR", false);
               }
 
               settingsUpdated = settings.were_settings_updated();

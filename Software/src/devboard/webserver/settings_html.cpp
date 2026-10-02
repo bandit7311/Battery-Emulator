@@ -267,6 +267,10 @@ String settings_processor(const String& var, BatteryEmulatorSettingsStore& setti
     return options_for_enum_with_none((BatteryType)settings.getUInt("BATTTYPE", (int)BatteryType::None),
                                       name_for_battery_type, BatteryType::None);
   }
+  if (var == "BATT2TYPE") {
+    return options_for_enum_with_none((BatteryType)settings.getUInt("BATT2TYPE", (int)BatteryType::None),
+                                      name_for_battery_type, BatteryType::None);
+  }
   if (var == "BATTCOMM") {
     return options_for_enum((comm_interface)settings.getUInt("BATTCOMM", (int)comm_interface::CanNative),
                             name_for_comm_interface);
@@ -506,6 +510,10 @@ String raw_settings_processor(const String& var, BatteryEmulatorSettingsStore& s
 
   if (var == "DBLBTR") {
     return settings.getBool("DBLBTR") ? "checked" : "";
+  }
+
+  if (var == "BATT2RXONLY") {
+    return settings.getBool("BATT2RXONLY") ? "checked" : "";
   }
 
   if (var == "TRIBTR") {
@@ -1844,10 +1852,19 @@ const char* getCANInterfaceName(CAN_Interface interface) {
         title="Enable this option if you intend to run two batteries in parallel" />
 
         <div class="if-dblbtr">
+            <label>Battery 2 type: </label>
+            <select name='BATT2TYPE'>
+                %BATT2TYPE%
+            </select>
+
             <label>Battery 2 interface: </label>
             <select name='BATT2COMM'>
                 %BATT2COMM%
             </select>
+
+            <label>Battery 2 RX only: </label>
+            <input type='checkbox' name='BATT2RXONLY' value='on' %BATT2RXONLY%
+                title="Never transmit anything on this CAN bus - pure listener. Use this when battery2 shares a bus with other active devices (e.g. a live vehicle) you don't want to interfere with. Disables polling; only passively broadcast values will be available." />
 
         <div class="if-tricapable">
         <label>Triple battery: </label>

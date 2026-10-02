@@ -61,6 +61,32 @@
 
 class RenaultTwingoGen1Battery : public UdsCanBattery {
  public:
+  // /simulator page (02.10.): 27 cyclic signals, each individually toggleable. I = Installed, already sent
+  // for real elsewhere in this driver (the simulator checkbox for these just re-sends the same content as
+  // an extra, redundant frame - explicitly accepted, see the planning session). P = Planned, content below
+  // taken verbatim from the steady-state/most-common frame observed in Log_Twingo_Ladung.log (02.10.
+  // re-analysis). A = Assumed, meaning unconfirmed, but content is now ALSO taken from the same real log
+  // (not fabricated) wherever the ID actually appears there - every one of the 27 below does. Interval_ms
+  // is each ID's own measured median interval from that log, not the originally assumed grouping - three
+  // of them (0x427/0x42E/0x432/0x650/0x1FD) turned out to be 100ms in the real log, not the 1000ms
+  // originally assumed in the planning session. Public: the /simulator webserver page reads this table
+  // directly (type + array) to render the 27 rows without duplicating the data on the webserver side.
+  struct SimSignal {
+    uint32_t id;
+    uint8_t dlc;
+    uint8_t data[8];
+    uint16_t interval_ms;
+    char tag;  // 'I', 'P' or 'A'
+    bool bms_origin;
+    const char* label;
+  };
+  static const uint8_t SIM_SIGNAL_COUNT = 28;  // 27 + 0x55D (02.10., real log, EVC->LBC direction assumed)
+  static const SimSignal sim_signals[SIM_SIGNAL_COUNT];
+
+  // "Read DTC details" (02.10., UNTESTED) - public so the webserver route can call it; implementation and
+  // its backing state are private, see read_DTC() nearby in the .cpp for the matching pattern.
+  void read_DTC_details();
+
   // Use this constructor for the second battery.
   RenaultTwingoGen1Battery(DATALAYER_BATTERY_TYPE* datalayer_ptr, CAN_Interface targetCan) : UdsCanBattery(targetCan) {
     datalayer_battery = datalayer_ptr;
@@ -85,7 +111,7 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   String get_uds_info_html() override;
   const char* get_dtc_json_filename() override { return "renault_zoe_gen1_dtc.json"; }
   bool get_dtc_standard_code_string() override { return false; }
-  void read_DTC() override;
+  void read_DTC() override;  // uses dtc_ext_read_mask below (default 0x09, Active/Confirmed)
   void reset_DTC() override;
 #ifdef TWINGO_EXTENDED_CELL_POLLING
   bool supports_reset_NVROL() override { return true; }
@@ -169,24 +195,20 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
                                    .ID = 0x69F,
                                    .data = {0x71, 0x30, 0x28, 0x2F}};
 
-  // EVC<->LBC 10ms heartbeat pair (see datalayer_extended.twingoGen1.evc_heartbeat_enabled) - content
-  // bytes taken verbatim from a real Log_Twingo_Ladung.log capture (01.10.), confirmed at ~9.5ms/~9.5ms
-  // real-world cadence. 0x1F8 byte 5 is rewritten each send to the awake/shutdown value, see
-  // send_evc_heartbeat(); the rest of both frames stays exactly as captured - unverified beyond that
-  // (e.g. 0x18A byte 6 varies in the real log, looks like a checksum, but the algorithm is unknown, so
-  // it is left at the first-seen value here rather than guessed).
-  CAN_frame TWINGO_1F8_HEARTBEAT = {.FD = false,
-                                    .ext_ID = false,
-                                    .DLC = 8,
-                                    .ID = 0x1F8,
-                                    .data = {0x00, 0x84, 0xFF, 0xFF, 0xFE, 0x00, 0x00, 0x0F}};
-  CAN_frame TWINGO_18A_HEARTBEAT_RESPONSE = {.FD = false,
-                                             .ext_ID = false,
-                                             .DLC = 8,
-                                             .ID = 0x18A,
-                                             .data = {0xFF, 0xF0, 0x00, 0x06, 0x40, 0x3C, 0xD5, 0x70}};
-  unsigned long previousMillis_evc_heartbeat = 0;
-  uint8_t evc_heartbeat_18a_counter = 0x07;  // nibble index into the observed 0x70,0x80,...,0xF0,0x00... sequence
+  // 0x1F8/0x18A dynamic content (byte5 relay coupling / byte7 rolling counter) is now handled as a
+  // special case inside send_simulator_signals(), same mechanism as the 0x55D drive-mode override - see
+  // RENAULT-TWINGO-GEN1-BATTERY.cpp. sim_18a_counter replaces the old evc_heartbeat_18a_counter.
+  uint8_t sim_18a_counter = 0x07;  // nibble index into the observed 0x70,0x80,...,0xF0,0x00... sequence
+
+  unsigned long sim_last_send_ms[SIM_SIGNAL_COUNT] = {0};
+  void send_simulator_signals(unsigned long currentMillis);
+
+  // EXPERIMENTAL (02.10.): staged precharge/main-relay sequence for 0x55D, auto-triggered by the rising
+  // edge of datalayer_extended.twingoGen1.sim_55d_rest_active_enabled (edge detection + timer state also
+  // live there, not as battery-instance members, so the webserver route can set the checkbox value
+  // without needing the Twingo-specific battery type). Intermediate byte0 values (0x02/0x04) are GUESSED
+  // (Gemini's original, unconfirmed suggestion), not from any log.
+  static const unsigned long SIM_55D_STAGE_DURATION_MS = 200;  // per stage, GUESSED, no real timing data
 
   // Experiment (only sent during the shutdown sequence's C3/C2 stages, see transmit_can()): 0x214 was
   // found in Log_Twingo_Ladung.log changing in lockstep with 0x350's own C3/C2 ("08 00") vs. C0/00/awake
@@ -253,7 +275,6 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   unsigned long previousMillis_090 = 0;
   unsigned long previousMillis_242 = 0;
   void send_fast_frames(unsigned long currentMillis);
-  void send_evc_heartbeat(unsigned long currentMillis);
 #endif
 
   // Boot plausibility filter for the temperatures of the 0x424 broadcast (BATTERY_OVERHEAT used to trigger
@@ -266,6 +287,19 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   static const unsigned long TEMP_BOOT_FILTER_TIMEOUT_MS = 60000;
   bool temp_boot_filter_active = true;
   unsigned long temp_boot_first_frame_ms = 0;  // 0 = no 0x424 seen yet in this boot phase
+
+  // Boot plausibility filter for 0x425 (LB_Cell_minimum/maximum_voltage), same pattern as the 0x424
+  // temperature filter above (02.10. phantom BATTERY_OVERVOLTAGE investigation - a corrupt 0x425 frame
+  // during the post-reset CAN-error burst can push these two fields up to their raw-field maximum of
+  // 6110mV, which feeds calculated_total_pack_voltage_mV unfiltered and can cross max_design_voltage_dV).
+  // Bounds reuse this project's own existing precedents: 4400mV is the same "implausible" ceiling already
+  // used for the cell_min/max_voltage_mV display filter further up; 2000mV is safety.cpp's own
+  // LOWEST_ALLOWED_CELLVOLTAGE_RECOVERY_CHARGE_MV, used here as a sane floor.
+  static const uint16_t EXT_425_BOOT_MIN_MV = 2000;
+  static const uint16_t EXT_425_BOOT_MAX_MV = 4400;
+  static const unsigned long EXT_425_BOOT_FILTER_TIMEOUT_MS = 60000;
+  bool ext425_boot_filter_active = true;
+  unsigned long ext425_boot_first_frame_ms = 0;  // 0 = no 0x425 seen yet in this boot phase
 
   // SOH candidate from broadcast 0x658 byte 4 & 0x7F (same frame OVMS reads; NOT confirmed for this pack).
   // Display only, it is not fed into the datalayer. 0xFF = nothing received, 0x7F = reported invalid.
@@ -369,6 +403,10 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   static const uint16_t EXT_POLL_USOC_AVG = 0x9002;
   static const uint16_t EXT_POLL_SOC_MIN = 0x91B9;
   static const uint16_t EXT_POLL_SOC_MAX = 0x91BA;
+  // 0x900D Battery Current: raw * 0.025 - 1200.0, result negated -> A (formula confirmed against RT32's
+  // own OVMS driver, RenaultTwingo3Ph2::PollReply_LBC() case 0x900D; display only, NOT fed into
+  // current_dA/the datalayer - that field still comes from 0x155/LB_Current_raw, see the ToDo list).
+  static const uint16_t EXT_POLL_BATTERY_CURRENT = 0x900D;
 
   // One raw value + "have we ever read it" flag per PID above. Kept as plain uint32_t (never negative for
   // any of these PIDs) so one small struct and one switch-case body covers every one of them.
@@ -378,16 +416,17 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   };
   ExtValue ext_mileage_pack, ext_mileage_vehicle, ext_lv_supply, ext_pack_voltage, ext_cell_v_a, ext_cell_v_b,
       ext_cell_v_a_nr, ext_cell_v_b_nr, ext_soh_avg, ext_max_charge_power, ext_max_gen_power,
-      ext_max_avail_power, ext_soc_avg, ext_usoc_avg, ext_soc_min, ext_soc_max;
+      ext_max_avail_power, ext_soc_avg, ext_usoc_avg, ext_soc_min, ext_soc_max, ext_battery_current;
   // One line for a display-only ExtValue: "label: value unit<br>" or "label: not yet read<br>".
   static void append_ext_value(String& s, const char* label, const ExtValue& v, double value, const char* unit);
 
   // 96 cell-voltage PIDs (0x9021-0x9083, skipping 0x9040/0x9060/0x9080) + the
   // 6 PIDs above + the 8 pack temperature PIDs + BMS state + 4 balancing counters
   // + 2 balancing counters while awake + 2 time PIDs + 16 display-only PIDs (mileage/voltage/SOC/SOH/power,
-  // see the comment above) = 135 poll targets, cycled continuously, one every
-  // 200ms (same cadence as Battery-Emulator's own Zoe Ph2 driver) -> ~27.0s/cycle.
-  static const uint8_t EXT_POLL_LIST_LENGTH = 135;
+  // see the comment above) + 1 display-only Battery Current PID (0x900D, see the comment above) = 136 poll
+  // targets, cycled continuously, one every
+  // 200ms (same cadence as Battery-Emulator's own Zoe Ph2 driver) -> ~27.2s/cycle.
+  static const uint8_t EXT_POLL_LIST_LENGTH = 136;
   const uint16_t ext_poll_list[EXT_POLL_LIST_LENGTH] = {
       0x9021, 0x9022, 0x9023, 0x9024, 0x9025, 0x9026, 0x9027, 0x9028,
       0x9029, 0x902A, 0x902B, 0x902C, 0x902D, 0x902E, 0x902F, 0x9030,
@@ -415,7 +454,7 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
       EXT_POLL_MILEAGE_PACK, EXT_POLL_MILEAGE_VEHICLE, EXT_POLL_LV_SUPPLY, EXT_POLL_PACK_VOLTAGE,
       EXT_POLL_CELL_V_A, EXT_POLL_CELL_V_B, EXT_POLL_CELL_V_A_NR, EXT_POLL_CELL_V_B_NR, EXT_POLL_SOH_AVG,
       EXT_POLL_MAX_CHARGE_POWER, EXT_POLL_MAX_GEN_POWER, EXT_POLL_MAX_AVAIL_POWER, EXT_POLL_SOC_AVG,
-      EXT_POLL_USOC_AVG, EXT_POLL_SOC_MIN, EXT_POLL_SOC_MAX};
+      EXT_POLL_USOC_AVG, EXT_POLL_SOC_MIN, EXT_POLL_SOC_MAX, EXT_POLL_BATTERY_CURRENT};
 
   uint8_t ext_poll_index = 0;
   unsigned long previousMillisExtPoll = 0;
@@ -588,7 +627,9 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
     DTC_EXT_READ_SESSION_SENT,  // session frame sent, waiting DTC_EXT_SESSION_GAP_MS before the command
     DTC_EXT_READ_CMD_SENT,      // command frame sent, waiting for a reply or DTC_EXT_REPLY_TIMEOUT_MS
     DTC_EXT_ERASE_SESSION_SENT,
-    DTC_EXT_ERASE_CMD_SENT
+    DTC_EXT_ERASE_CMD_SENT,
+    DTC_EXT_DETAILS_SESSION_SENT,  // "Read DTC details" button (02.10., UNTESTED, see read_DTC_details())
+    DTC_EXT_DETAILS_CMD_SENT       // queries DTC_DETAILS_CODES[dtc_ext_details_index] in turn
   };
   uint8_t dtc_ext_state = DTC_EXT_IDLE;
   unsigned long dtc_ext_step_start_ms = 0;
@@ -600,6 +641,15 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   static const unsigned long DTC_EXT_REPLY_TIMEOUT_MS = 2000;
   char dtc_ext_log_read[48] = "not run yet";
   char dtc_ext_log_erase[48] = "not run yet";
+
+  // "Read DTC details" (02.10., UNTESTED): queries UDS 0x19 subfunction 0x06 (reportDTCExtDataRecordByDTC
+  // Number, record 0xFF = all) for each of the two currently-known active DTCs in turn. Raw bytes only,
+  // logged exactly like dtc_ext_log_read above - nothing about the format is assumed, since it has never
+  // been seen. Whether the BMS even supports this subfunction is unverified.
+  static const uint8_t DTC_DETAILS_COUNT = 2;
+  static const uint32_t DTC_DETAILS_CODES[DTC_DETAILS_COUNT];  // {0xE14381, 0x1B0715}, defined in the .cpp
+  uint8_t dtc_ext_details_index = 0;
+  char dtc_ext_log_details[DTC_DETAILS_COUNT][80] = {"not run yet", "not run yet"};
   void handle_dtc_ext(unsigned long currentMillis);
   void handle_dtc_ext_reply(CAN_frame rx_frame);
   void handle_dtc_read_response(const uint8_t* data, uint16_t len);

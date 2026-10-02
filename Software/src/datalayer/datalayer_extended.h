@@ -238,13 +238,34 @@ struct DATALAYER_INFO_TWINGO_GEN1 {
   uint32_t cellwatch_sample_count;    // successful samples since cellwatch was last turned on
   uint32_t cellwatch_last_sample_ms;  // millis() of the last received sample (0 = none yet)
 
-  /** Simulates the EVC-side 0x1F8/0x18A 10ms heartbeat pair that a real vehicle's EVC/LBC exchange,
-   *  confirmed present in a real Log_Twingo_Ladung.log capture (01.10.) but never sent by this emulator
-   *  (standalone battery, no real EVC). 0x1F8 byte 5 is coupled to NVROLstateMachine - 0x00 while awake,
-   *  0xFA while the shutdown/sleep sequence is announced or silent, matching the real log's FA->00
-   *  transition observed at the real vehicle's contactor-close moment. Settable on "More Battery Info",
-   *  persisted to NVM on explicit request (unlike Cellwatch) - the user wants reboot-stable testing. */
-  bool evc_heartbeat_enabled;
+  /** /simulator page (02.10.): one bit per signal (bit i = sim_signals[i], see
+   *  RENAULT-TWINGO-GEN1-BATTERY.h/.cpp). Default: the 10 "Installed" signals (bits 0-9) on, all 17
+   *  new ones off - matches the planning session. Persisted to NVM like evc_heartbeat_enabled. */
+  uint32_t simulator_enabled_mask;  // non-zero default set explicitly in the constructor below (memset(0))
+
+  /** EXPERIMENTAL (02.10.): when 0x55D is enabled on /simulator, send an unsourced static
+   *  "drive/discharge active" byte pattern instead of the real-log steady-state content. Off by
+   *  default. See the long code comment at SIM_55D_DRIVE_MODE_DATA in
+   *  RENAULT-TWINGO-GEN1-BATTERY.cpp for why this is kept separate and unverified. */
+  bool sim_55d_drive_mode_enabled = false;
+
+  /** EXPERIMENTAL (02.10.), NOT persisted (runtime only, like Cellwatch): off = send the REST/idle
+   *  content for 0x55D continuously; the rising edge (off->on) of this checkbox itself starts the
+   *  staged precharge/main-relay sequence (see sim_55d_stage_start_ms below), which then settles on
+   *  the normal/drive content while this stays on. Falling edge (on->off) reverts to REST immediately,
+   *  no staged animation back. */
+  bool sim_55d_rest_active_enabled = false;
+  bool sim_55d_rest_active_prev = false;  // internal: detects the rising edge above, not a UI setting
+
+  /** EXPERIMENTAL (02.10.), NOT persisted: start timestamp (millis()) of the staged precharge/main-relay
+   *  sequence, set automatically on the rising edge of sim_55d_rest_active_enabled. 0 = not running. See
+   *  RenaultTwingoGen1Battery::SIM_55D_STAGE_DURATION_MS for the (guessed) per-stage timing. */
+  unsigned long sim_55d_stage_start_ms = 0;
+
+  /** Status mask for the next read_DTC() call - 0x09 (Active/Confirmed, default) or 0xFF (all statuses,
+   *  same mask an external ELM tool used successfully: 01.10., confirmed 183 entries, 7 non-zero incl.
+   *  all 6 already-known DTCs). Settable on "More Battery Info" via a checkbox, NOT persisted to NVM. */
+  uint8_t dtc_ext_read_mask = 0x09;
 };
 
 struct DATALAYER_INFO_CELLPOWER {
@@ -1092,6 +1113,7 @@ class DataLayerExtended {
     // correct via the memset(0) above; only the non-zero default needs setting here.
     twingoGen1.sleep_failsafe_minutes = 30;
     twingoGen1.cellwatch_cell = 1;
+    twingoGen1.simulator_enabled_mask = 0x000003FF;  // the 10 "I" signals on, see sim_signals[0..9]
   }
 };
 

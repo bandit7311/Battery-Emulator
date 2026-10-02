@@ -1,0 +1,337 @@
+diff -ruN a/Software/src/battery/RENAULT-TWINGO-GEN1-BATTERY.cpp b/Software/src/battery/RENAULT-TWINGO-GEN1-BATTERY.cpp
+--- a/Software/src/battery/RENAULT-TWINGO-GEN1-BATTERY.cpp	2026-10-02 12:01:02.059983337 +0000
++++ b/Software/src/battery/RENAULT-TWINGO-GEN1-BATTERY.cpp	2026-10-02 12:59:59.174647261 +0000
+@@ -197,6 +197,28 @@
+   // dropped a fully, correctly reassembled reply because of this.
+   // For a negative response, byte[1]=0x7F, byte[2]=<requested SID>=0x19, byte[3]=NRC - so pid's high
+   // byte is 0x19. Both are handled here instead of falling through to the PID switch below.
++  if (dtc_ext_state == DTC_EXT_DETAILS_CMD_SENT) {
++    // Raw bytes only, single-frame reply assumed (no multi-frame reassembly hooked up for this specific,
++    // UNTESTED flow) - logged as hex exactly as received, nothing about the format assumed.
++    char* out = dtc_ext_log_details[dtc_ext_details_index];
++    size_t outsz = sizeof(dtc_ext_log_details[dtc_ext_details_index]);
++    size_t pos = 0;
++    for (uint16_t i = 0; i < length && pos + 3 < outsz; i++) {
++      pos += snprintf(out + pos, outsz - pos, "%02X ", data[i]);
++    }
++    if (pos == 0) {
++      strncpy(out, "(empty reply)", outsz - 1);
++    }
++    dtc_ext_details_index++;
++    if (dtc_ext_details_index < DTC_DETAILS_COUNT) {
++      dtc_ext_step_start_ms = millis();
++      dtc_ext_state = DTC_EXT_DETAILS_SESSION_SENT;  // next DTC
++    } else {
++      ZOE_POLL_18DADBF1.data = {0x03, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};  // restore poll template
++      dtc_ext_state = DTC_EXT_IDLE;
++    }
++    return;
++  }
+   if (dtc_ext_state == DTC_EXT_READ_CMD_SENT) {
+     if ((pid >> 8) == 0x19) {
+       snprintf(dtc_ext_log_read, sizeof(dtc_ext_log_read), "NEGATIVE SID=0x19 NRC=0x%02X", pid & 0xFF);
+@@ -1814,6 +1836,11 @@
+ // mask bit for 0x55D, it only swaps which bytes get sent IF that bit is already on.
+ static const uint8_t SIM_55D_DRIVE_MODE_DATA[8] = {0x05, 0xFD, 0xF0, 0x01, 0x00, 0x00, 0x00, 0x81};
+ 
++// EXPERIMENTAL, GUESSED (02.10.): "rest/idle" content for 0x55D - only byte 0 changed from the real,
++// confirmed content (same reasoning as the drive-mode override: not from any log, no vehicle idle capture
++// exists). 0x01 taken from Gemini's original, unconfirmed suggestion ("Sleep/Init").
++static const uint8_t SIM_55D_REST_DATA[8] = {0x01, 0xFD, 0xF4, 0x0F, 0x91, 0x00, 0x00, 0x81};
++
+ void RenaultTwingoGen1Battery::send_simulator_signals(unsigned long currentMillis) {
+   // Same true-silence rule as send_fast_frames()/the old send_evc_heartbeat() - applies to ALL 28 rows,
+   // not just 0x1F8/0x18A (02.10. decision): C0/00 stage of shutdown, and the start of the wake burst.
+@@ -1855,8 +1882,38 @@
+       // wraps at 0x100). Same counter variable/logic as the old send_evc_heartbeat().
+       sim_18a_counter = (uint8_t)((sim_18a_counter + 1) & 0x0F);
+       f.data.u8[7] = (uint8_t)(sim_18a_counter << 4);
+-    } else if (sim_signals[i].id == 0x55D && datalayer_extended.twingoGen1.sim_55d_drive_mode_enabled) {
+-      memcpy(f.data.u8, SIM_55D_DRIVE_MODE_DATA, 8);
++    } else if (sim_signals[i].id == 0x55D) {
++      bool restActive = datalayer_extended.twingoGen1.sim_55d_rest_active_enabled;
++      bool restActivePrev = datalayer_extended.twingoGen1.sim_55d_rest_active_prev;
++      if (restActive && !restActivePrev) {
++        // Rising edge: start the staged precharge/main-relay sequence.
++        datalayer_extended.twingoGen1.sim_55d_stage_start_ms = currentMillis;
++      } else if (!restActive && restActivePrev) {
++        // Falling edge: back to REST immediately, no staged animation back.
++        datalayer_extended.twingoGen1.sim_55d_stage_start_ms = 0;
++      }
++      datalayer_extended.twingoGen1.sim_55d_rest_active_prev = restActive;
++
++      if (!restActive) {
++        memcpy(f.data.u8, SIM_55D_REST_DATA, 8);
++      } else if (datalayer_extended.twingoGen1.sim_55d_drive_mode_enabled) {
++        memcpy(f.data.u8, SIM_55D_DRIVE_MODE_DATA, 8);
++      }
++      // else: restActive and not drive mode -> leave the already-memcpy'd normal/real content as-is
++
++      // Staged sequence overrides byte 0 only, on top of whichever target content was just selected above
++      // - see the header comment, GUESSED intermediate values (precharge, then main relay closing).
++      unsigned long stage_start = datalayer_extended.twingoGen1.sim_55d_stage_start_ms;
++      if (stage_start != 0) {
++        unsigned long elapsed = currentMillis - stage_start;
++        if (elapsed < SIM_55D_STAGE_DURATION_MS) {
++          f.data.u8[0] = 0x02;  // GUESSED: "Precharge"
++        } else if (elapsed < 2 * SIM_55D_STAGE_DURATION_MS) {
++          f.data.u8[0] = 0x04;  // GUESSED: "Main relay closing"
++        } else {
++          datalayer_extended.twingoGen1.sim_55d_stage_start_ms = 0;  // done, settle on the target content
++        }
++      }
+     }
+     transmit_can_frame(&f);
+   }
+@@ -2141,6 +2198,8 @@
+     content += "var x=new XMLHttpRequest();x.open('GET','/editTwingoSleepMinutes?value='+m,true);x.send();}";
+     content += "function twingoSetCellwatchEnable(v){";
+     content += "var x=new XMLHttpRequest();x.open('GET','/editTwingoCellwatchEnable?value='+(v?1:0),true);x.send();}";
++    content += "function twingoSetDtcAllStatus(v){";
++    content += "var x=new XMLHttpRequest();x.open('GET','/editTwingoDtcAllStatus?value='+(v?1:0),true);x.send();}";
+     content += "function twingoSetCellwatchCell(){";
+     content += "var c=document.getElementById('twingoCellwatchCell').value;";
+     content += "var x=new XMLHttpRequest();x.open('GET','/editTwingoCellwatchCell?value='+c,true);x.send();}";
+@@ -2156,8 +2215,15 @@
+              "NVROL Log - Write 9281=0 (activated): " << nvrol_log[3] << "<br>"
+              "NVROL Log - Read back 0x9281: " << nvrol_log[4] << "<br>"
+              "Temporisation right after the write (read back): " << temporisation_text(temporisation_readback) << "<br>"
++             "<input type='checkbox' id='twingoDtcAllStatus' onclick='twingoSetDtcAllStatus(this.checked)' "
++             << (datalayer_extended.twingoGen1.dtc_ext_read_mask == 0xFF ? "checked>" : ">") <<
++             " Read ALL DTC statuses (mask 0xFF) instead of only Active/Confirmed (0x09) on next Read DTC<br>"
+              "DTC Read (ext. protocol, Read DTC button): " << dtc_ext_log_read << "<br>"
+-             "DTC Erase (ext. protocol, Erase DTC button): " << dtc_ext_log_erase << "<br>";
++             "DTC Erase (ext. protocol, Erase DTC button): " << dtc_ext_log_erase << "<br>"
++             "<button onclick=\"fetch('/triggerTwingoDtcDetails')\">Read DTC details (EXPERIMENTAL, UNTESTED, "
++             "subfunction 0x06)</button><br>"
++             "DTC details - " << String(DTC_DETAILS_CODES[0], HEX) << ": " << dtc_ext_log_details[0] << "<br>"
++             "DTC details - " << String(DTC_DETAILS_CODES[1], HEX) << ": " << dtc_ext_log_details[1] << "<br>";
+   // clang-format on
+   append_quiet_html(content);
+   content << "</div>";
+@@ -2226,6 +2292,23 @@
+   dtc_ext_step_start_ms = millis();
+ }
+ 
++const uint32_t RenaultTwingoGen1Battery::DTC_DETAILS_CODES[DTC_DETAILS_COUNT] = {0xE14381, 0x1B0715};
++
++void RenaultTwingoGen1Battery::read_DTC_details() {
++  if (dtc_ext_state != DTC_EXT_IDLE || UserRequestNVROLReset) {
++    return;
++  }
++  dtc_ext_details_index = 0;
++  ZOE_POLL_18DADBF1.data = {0x02, 0x10, 0x03, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};  // open extended session
++  transmit_can_frame(&ZOE_POLL_18DADBF1);
++  for (uint8_t i = 0; i < DTC_DETAILS_COUNT; i++) {
++    strncpy(dtc_ext_log_details[i], "requested", sizeof(dtc_ext_log_details[i]) - 1);
++    dtc_ext_log_details[i][sizeof(dtc_ext_log_details[i]) - 1] = '\0';
++  }
++  dtc_ext_state = DTC_EXT_DETAILS_SESSION_SENT;
++  dtc_ext_step_start_ms = millis();
++}
++
+ void RenaultTwingoGen1Battery::reset_DTC() {
+   if (dtc_ext_state != DTC_EXT_IDLE || UserRequestNVROLReset) {
+     return;
+@@ -2251,9 +2334,10 @@
+ 
+     case DTC_EXT_READ_SESSION_SENT:
+       if (currentMillis - dtc_ext_step_start_ms >= DTC_EXT_SESSION_GAP_MS) {
+-        // Gap elapsed: send ReadDTCInformation, status mask 0x09 (Active/Confirmed) - same mask the
+-        // old, broken KWP path used, for comparability if it ever does answer too.
+-        ZOE_POLL_18DADBF1.data = {0x03, 0x19, 0x02, 0x09, 0xAA, 0xAA, 0xAA, 0xAA};
++        // Gap elapsed: send ReadDTCInformation, status mask (0x09 default, or 0xFF if the "all statuses"
++        // checkbox was ticked before pressing Read DTC).
++        ZOE_POLL_18DADBF1.data = {0x03, 0x19, 0x02, datalayer_extended.twingoGen1.dtc_ext_read_mask, 0xAA,
++                                   0xAA, 0xAA, 0xAA};
+         transmit_can_frame(&ZOE_POLL_18DADBF1);
+         dtc_ext_step_start_ms = currentMillis;
+         dtc_ext_state = DTC_EXT_READ_CMD_SENT;
+@@ -2286,6 +2370,34 @@
+         dtc_ext_state = DTC_EXT_IDLE;
+       }
+       break;
++
++    case DTC_EXT_DETAILS_SESSION_SENT:
++      if (currentMillis - dtc_ext_step_start_ms >= DTC_EXT_SESSION_GAP_MS) {
++        // ReadDTCInformation, subfunction 0x06 (reportDTCExtDataRecordByDTCNumber), record 0xFF (all
++        // records) for DTC_DETAILS_CODES[dtc_ext_details_index].
++        uint32_t code = DTC_DETAILS_CODES[dtc_ext_details_index];
++        ZOE_POLL_18DADBF1.data = {0x06, 0x19, 0x06, (uint8_t)(code >> 16), (uint8_t)(code >> 8),
++                                   (uint8_t)code, 0xFF, 0xAA};
++        transmit_can_frame(&ZOE_POLL_18DADBF1);
++        dtc_ext_step_start_ms = currentMillis;
++        dtc_ext_state = DTC_EXT_DETAILS_CMD_SENT;
++      }
++      break;
++    case DTC_EXT_DETAILS_CMD_SENT:
++      if (currentMillis - dtc_ext_step_start_ms >= DTC_EXT_REPLY_TIMEOUT_MS) {
++        strncpy(dtc_ext_log_details[dtc_ext_details_index], "no response",
++                sizeof(dtc_ext_log_details[dtc_ext_details_index]) - 1);
++        dtc_ext_log_details[dtc_ext_details_index][sizeof(dtc_ext_log_details[dtc_ext_details_index]) - 1] = '\0';
++        dtc_ext_details_index++;
++        if (dtc_ext_details_index < DTC_DETAILS_COUNT) {
++          dtc_ext_step_start_ms = currentMillis;
++          dtc_ext_state = DTC_EXT_DETAILS_SESSION_SENT;  // next DTC
++        } else {
++          ZOE_POLL_18DADBF1.data = {0x03, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};  // restore poll template
++          dtc_ext_state = DTC_EXT_IDLE;
++        }
++      }
++      break;
+   }
+ }
+ 
+diff -ruN a/Software/src/battery/RENAULT-TWINGO-GEN1-BATTERY.h b/Software/src/battery/RENAULT-TWINGO-GEN1-BATTERY.h
+--- a/Software/src/battery/RENAULT-TWINGO-GEN1-BATTERY.h	2026-10-02 12:01:01.888352984 +0000
++++ b/Software/src/battery/RENAULT-TWINGO-GEN1-BATTERY.h	2026-10-02 12:59:59.172959365 +0000
+@@ -83,6 +83,10 @@
+   static const uint8_t SIM_SIGNAL_COUNT = 28;  // 27 + 0x55D (02.10., real log, EVC->LBC direction assumed)
+   static const SimSignal sim_signals[SIM_SIGNAL_COUNT];
+ 
++  // "Read DTC details" (02.10., UNTESTED) - public so the webserver route can call it; implementation and
++  // its backing state are private, see read_DTC() nearby in the .cpp for the matching pattern.
++  void read_DTC_details();
++
+   // Use this constructor for the second battery.
+   RenaultTwingoGen1Battery(DATALAYER_BATTERY_TYPE* datalayer_ptr, CAN_Interface targetCan) : UdsCanBattery(targetCan) {
+     datalayer_battery = datalayer_ptr;
+@@ -107,7 +111,7 @@
+   String get_uds_info_html() override;
+   const char* get_dtc_json_filename() override { return "renault_zoe_gen1_dtc.json"; }
+   bool get_dtc_standard_code_string() override { return false; }
+-  void read_DTC() override;
++  void read_DTC() override;  // uses dtc_ext_read_mask below (default 0x09, Active/Confirmed)
+   void reset_DTC() override;
+ #ifdef TWINGO_EXTENDED_CELL_POLLING
+   bool supports_reset_NVROL() override { return true; }
+@@ -199,6 +203,13 @@
+   unsigned long sim_last_send_ms[SIM_SIGNAL_COUNT] = {0};
+   void send_simulator_signals(unsigned long currentMillis);
+ 
++  // EXPERIMENTAL (02.10.): staged precharge/main-relay sequence for 0x55D, auto-triggered by the rising
++  // edge of datalayer_extended.twingoGen1.sim_55d_rest_active_enabled (edge detection + timer state also
++  // live there, not as battery-instance members, so the webserver route can set the checkbox value
++  // without needing the Twingo-specific battery type). Intermediate byte0 values (0x02/0x04) are GUESSED
++  // (Gemini's original, unconfirmed suggestion), not from any log.
++  static const unsigned long SIM_55D_STAGE_DURATION_MS = 200;  // per stage, GUESSED, no real timing data
++
+   // Experiment (only sent during the shutdown sequence's C3/C2 stages, see transmit_can()): 0x214 was
+   // found in Log_Twingo_Ladung.log changing in lockstep with 0x350's own C3/C2 ("08 00") vs. C0/00/awake
+   // ("F8 3E") states, only 0.03-0.19s after each transition - possibly the EVC's own wake/sleep request
+@@ -616,7 +627,9 @@
+     DTC_EXT_READ_SESSION_SENT,  // session frame sent, waiting DTC_EXT_SESSION_GAP_MS before the command
+     DTC_EXT_READ_CMD_SENT,      // command frame sent, waiting for a reply or DTC_EXT_REPLY_TIMEOUT_MS
+     DTC_EXT_ERASE_SESSION_SENT,
+-    DTC_EXT_ERASE_CMD_SENT
++    DTC_EXT_ERASE_CMD_SENT,
++    DTC_EXT_DETAILS_SESSION_SENT,  // "Read DTC details" button (02.10., UNTESTED, see read_DTC_details())
++    DTC_EXT_DETAILS_CMD_SENT       // queries DTC_DETAILS_CODES[dtc_ext_details_index] in turn
+   };
+   uint8_t dtc_ext_state = DTC_EXT_IDLE;
+   unsigned long dtc_ext_step_start_ms = 0;
+@@ -628,6 +641,15 @@
+   static const unsigned long DTC_EXT_REPLY_TIMEOUT_MS = 2000;
+   char dtc_ext_log_read[48] = "not run yet";
+   char dtc_ext_log_erase[48] = "not run yet";
++
++  // "Read DTC details" (02.10., UNTESTED): queries UDS 0x19 subfunction 0x06 (reportDTCExtDataRecordByDTC
++  // Number, record 0xFF = all) for each of the two currently-known active DTCs in turn. Raw bytes only,
++  // logged exactly like dtc_ext_log_read above - nothing about the format is assumed, since it has never
++  // been seen. Whether the BMS even supports this subfunction is unverified.
++  static const uint8_t DTC_DETAILS_COUNT = 2;
++  static const uint32_t DTC_DETAILS_CODES[DTC_DETAILS_COUNT];  // {0xE14381, 0x1B0715}, defined in the .cpp
++  uint8_t dtc_ext_details_index = 0;
++  char dtc_ext_log_details[DTC_DETAILS_COUNT][80] = {"not run yet", "not run yet"};
+   void handle_dtc_ext(unsigned long currentMillis);
+   void handle_dtc_ext_reply(CAN_frame rx_frame);
+   void handle_dtc_read_response(const uint8_t* data, uint16_t len);
+diff -ruN a/Software/src/datalayer/datalayer_extended.h b/Software/src/datalayer/datalayer_extended.h
+--- a/Software/src/datalayer/datalayer_extended.h	2026-10-02 12:01:02.064005070 +0000
++++ b/Software/src/datalayer/datalayer_extended.h	2026-10-02 12:59:59.176757082 +0000
+@@ -248,6 +248,24 @@
+    *  default. See the long code comment at SIM_55D_DRIVE_MODE_DATA in
+    *  RENAULT-TWINGO-GEN1-BATTERY.cpp for why this is kept separate and unverified. */
+   bool sim_55d_drive_mode_enabled = false;
++
++  /** EXPERIMENTAL (02.10.), NOT persisted (runtime only, like Cellwatch): off = send the REST/idle
++   *  content for 0x55D continuously; the rising edge (off->on) of this checkbox itself starts the
++   *  staged precharge/main-relay sequence (see sim_55d_stage_start_ms below), which then settles on
++   *  the normal/drive content while this stays on. Falling edge (on->off) reverts to REST immediately,
++   *  no staged animation back. */
++  bool sim_55d_rest_active_enabled = false;
++  bool sim_55d_rest_active_prev = false;  // internal: detects the rising edge above, not a UI setting
++
++  /** EXPERIMENTAL (02.10.), NOT persisted: start timestamp (millis()) of the staged precharge/main-relay
++   *  sequence, set automatically on the rising edge of sim_55d_rest_active_enabled. 0 = not running. See
++   *  RenaultTwingoGen1Battery::SIM_55D_STAGE_DURATION_MS for the (guessed) per-stage timing. */
++  unsigned long sim_55d_stage_start_ms = 0;
++
++  /** Status mask for the next read_DTC() call - 0x09 (Active/Confirmed, default) or 0xFF (all statuses,
++   *  same mask an external ELM tool used successfully: 01.10., confirmed 183 entries, 7 non-zero incl.
++   *  all 6 already-known DTCs). Settable on "More Battery Info" via a checkbox, NOT persisted to NVM. */
++  uint8_t dtc_ext_read_mask = 0x09;
+ };
+ 
+ struct DATALAYER_INFO_CELLPOWER {
+diff -ruN a/Software/src/devboard/webserver/simulator_html.cpp b/Software/src/devboard/webserver/simulator_html.cpp
+--- a/Software/src/devboard/webserver/simulator_html.cpp	2026-10-02 12:01:02.073909309 +0000
++++ b/Software/src/devboard/webserver/simulator_html.cpp	2026-10-02 12:59:59.182833268 +0000
+@@ -140,6 +140,18 @@
+     content += "<tr><td>Byte 7</td><td>0x81</td><td>Interlock_OK (claimed)</td></tr>";
+     content += "</tbody></table>";
+ 
++    bool restActive = datalayer_extended.twingoGen1.sim_55d_rest_active_enabled;
++    content +=
++        "<h3 style='color:#ff9b9b;'>EXPERIMENTAL - rest state &amp; staged relay closing</h3>"
++        "<p>Off: 0x55D continuously sends a GUESSED \"rest/idle\" content (byte 0 = 0x01). Ticking this "
++        "box starts a staged sequence - byte 0 steps 0x02 (\"Precharge\", GUESSED) &rarr; 0x04 (\"Main "
++        "relay closing\", GUESSED) &rarr; settles on the normal/drive content above (REAL), 200ms per "
++        "stage (GUESSED timing, no real log data). Unticking reverts to rest immediately. Only works "
++        "while the 0x55D row checkbox is also on.</p>";
++    content += "<label><input type='checkbox' id='sim55dRestActive' " + String(restActive ? "checked " : "") +
++               "onchange=\"fetch('/editTwingoSim55dRestActive?value='+(this.checked?1:0))\"> "
++               "Active (precharge &amp; close main relay)</label>";
++
+     content += "<p><a href='/advanced' style='color:#8fd3ff;'>Back to More Battery Info</a></p>";
+     return content;
+   }
+diff -ruN a/Software/src/devboard/webserver/webserver.cpp b/Software/src/devboard/webserver/webserver.cpp
+--- a/Software/src/devboard/webserver/webserver.cpp	2026-10-02 12:01:02.077004940 +0000
++++ b/Software/src/devboard/webserver/webserver.cpp	2026-10-02 12:59:59.184615967 +0000
+@@ -838,6 +838,35 @@
+     request->send(200, "text/plain", "OK");
+   });
+ 
++  // Status mask (0x09/0xFF) for the next "Read DTC" press - see datalayer_extended.h.
++  def_route_with_auth("/editTwingoDtcAllStatus", server, HTTP_GET, [](AsyncWebServerRequest* request) {
++    if (request->hasParam("value")) {
++      bool all = request->getParam("value")->value().toInt() != 0;
++      datalayer_extended.twingoGen1.dtc_ext_read_mask = all ? 0xFF : 0x09;
++    }
++    request->send(200, "text/plain", "OK");
++  });
++
++  // "Read DTC details" button (02.10., EXPERIMENTAL/UNTESTED) - queries UDS 0x19 subfunction 0x06 for the
++  // two currently-known active DTCs. See read_DTC_details() in RENAULT-TWINGO-GEN1-BATTERY.cpp/.h.
++  // battery is a generic Battery*; this route only exists meaningfully for the Twingo build (the button
++  // itself only renders there), so the cast is safe in context - same caveat applies as any other
++  // single-battery-type Twingo-specific route sharing this file.
++  def_route_with_auth("/triggerTwingoDtcDetails", server, HTTP_GET, [](AsyncWebServerRequest* request) {
++    static_cast<RenaultTwingoGen1Battery*>(battery)->read_DTC_details();
++    request->send(200, "text/plain", "OK");
++  });
++
++  // EXPERIMENTAL rest/active toggle for 0x55D - not persisted, runtime only. The rising/falling edge is
++  // detected in send_simulator_signals() itself (compares against sim_55d_rest_active_prev), this route
++  // only writes the raw checkbox value.
++  def_route_with_auth("/editTwingoSim55dRestActive", server, HTTP_GET, [](AsyncWebServerRequest* request) {
++    if (request->hasParam("value")) {
++      datalayer_extended.twingoGen1.sim_55d_rest_active_enabled = request->getParam("value")->value().toInt() != 0;
++    }
++    request->send(200, "text/plain", "OK");
++  });
++
+   // EXPERIMENTAL, unverified - see the long comment at SIM_55D_DRIVE_MODE_DATA in
+   // RENAULT-TWINGO-GEN1-BATTERY.cpp. Off by default.
+   def_route_with_auth("/editTwingoSim55dDriveMode", server, HTTP_GET, [](AsyncWebServerRequest* request) {

@@ -44,7 +44,9 @@ AsyncAuthenticationMiddleware web_auth_middleware;
 static MyTimer ota_progress_timer = MyTimer(1000);
 
 #include "advanced_battery_html.h"
+#include "../../battery/RENAULT-TWINGO-GEN1-BATTERY.h"
 #include "cellwatch_html.h"
+#include "simulator_html.h"
 #include "can_logging_html.h"
 #include "can_replay_html.h"
 #include "cellmonitor_html.h"
@@ -206,8 +208,10 @@ void init_webserver() {
           prefs.getBool("TWINGOB009PR", datalayer_extended.twingoGen1.nvrol_b009_use_programming_session);
       datalayer_extended.twingoGen1.sleep_failsafe_minutes =
           (uint16_t)prefs.getUInt("TWINGOSLPMIN", datalayer_extended.twingoGen1.sleep_failsafe_minutes);
-      datalayer_extended.twingoGen1.evc_heartbeat_enabled =
-          prefs.getBool("TWINGOEVCHB", datalayer_extended.twingoGen1.evc_heartbeat_enabled);
+      datalayer_extended.twingoGen1.simulator_enabled_mask =
+          prefs.getUInt("TWINGOSIMMASK", datalayer_extended.twingoGen1.simulator_enabled_mask);
+      datalayer_extended.twingoGen1.sim_55d_drive_mode_enabled =
+          prefs.getBool("TWINGOSIM55DDRV", datalayer_extended.twingoGen1.sim_55d_drive_mode_enabled);
       prefs.end();
     }
   }
@@ -759,20 +763,6 @@ void init_webserver() {
     request->send(200, "text/plain", "OK");
   });
 
-  // EVC heartbeat simulation (0x1F8/0x18A, see datalayer_extended.h) - unlike Cellwatch, persisted to
-  // NVM on explicit user request, so a chosen test configuration survives a reboot.
-  def_route_with_auth("/editTwingoEvcHeartbeat", server, HTTP_GET, [](AsyncWebServerRequest* request) {
-    if (request->hasParam("value")) {
-      bool enable = request->getParam("value")->value().toInt() != 0;
-      datalayer_extended.twingoGen1.evc_heartbeat_enabled = enable;
-      Preferences prefs;
-      prefs.begin("batterySettings", false);
-      prefs.putBool("TWINGOEVCHB", enable);
-      prefs.end();
-    }
-    request->send(200, "text/plain", "OK");
-  });
-
   // Cellwatch: runtime-only diagnostic (fast single-cell poll), NOT persisted to NVM on purpose - always
   // starts disabled after a reboot, see datalayer_extended.h.
   def_route_with_auth("/editTwingoCellwatchEnable", server, HTTP_GET, [](AsyncWebServerRequest* request) {
@@ -819,6 +809,76 @@ void init_webserver() {
   // Route for going to the Cellwatch test page
   def_route_with_auth("/cellwatch", server, HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send(200, "text/html", index_html, cellwatch_processor);
+  });
+
+  // Route for going to the CAN Signal Simulator page (27 signals, see simulator_html.cpp)
+  def_route_with_auth("/simulator", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(200, "text/html", index_html, simulator_processor);
+  });
+
+  // One checkbox toggles one bit of simulator_enabled_mask, persisted to NVM as a single uint32.
+  def_route_with_auth("/editTwingoSimSignal", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("index") && request->hasParam("value")) {
+      int index = request->getParam("index")->value().toInt();
+      bool enable = request->getParam("value")->value().toInt() != 0;
+      if (index >= 0 && index < RenaultTwingoGen1Battery::SIM_SIGNAL_COUNT) {
+        uint32_t mask = datalayer_extended.twingoGen1.simulator_enabled_mask;
+        if (enable) {
+          mask |= (1UL << index);
+        } else {
+          mask &= ~(1UL << index);
+        }
+        datalayer_extended.twingoGen1.simulator_enabled_mask = mask;
+        Preferences prefs;
+        prefs.begin("batterySettings", false);
+        prefs.putUInt("TWINGOSIMMASK", mask);
+        prefs.end();
+      }
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  // Status mask (0x09/0xFF) for the next "Read DTC" press - see datalayer_extended.h.
+  def_route_with_auth("/editTwingoDtcAllStatus", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("value")) {
+      bool all = request->getParam("value")->value().toInt() != 0;
+      datalayer_extended.twingoGen1.dtc_ext_read_mask = all ? 0xFF : 0x09;
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  // "Read DTC details" button (02.10., EXPERIMENTAL/UNTESTED) - queries UDS 0x19 subfunction 0x06 for the
+  // two currently-known active DTCs. See read_DTC_details() in RENAULT-TWINGO-GEN1-BATTERY.cpp/.h.
+  // battery is a generic Battery*; this route only exists meaningfully for the Twingo build (the button
+  // itself only renders there), so the cast is safe in context - same caveat applies as any other
+  // single-battery-type Twingo-specific route sharing this file.
+  def_route_with_auth("/triggerTwingoDtcDetails", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    static_cast<RenaultTwingoGen1Battery*>(battery)->read_DTC_details();
+    request->send(200, "text/plain", "OK");
+  });
+
+  // EXPERIMENTAL rest/active toggle for 0x55D - not persisted, runtime only. The rising/falling edge is
+  // detected in send_simulator_signals() itself (compares against sim_55d_rest_active_prev), this route
+  // only writes the raw checkbox value.
+  def_route_with_auth("/editTwingoSim55dRestActive", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("value")) {
+      datalayer_extended.twingoGen1.sim_55d_rest_active_enabled = request->getParam("value")->value().toInt() != 0;
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  // EXPERIMENTAL, unverified - see the long comment at SIM_55D_DRIVE_MODE_DATA in
+  // RENAULT-TWINGO-GEN1-BATTERY.cpp. Off by default.
+  def_route_with_auth("/editTwingoSim55dDriveMode", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("value")) {
+      bool enable = request->getParam("value")->value().toInt() != 0;
+      datalayer_extended.twingoGen1.sim_55d_drive_mode_enabled = enable;
+      Preferences prefs;
+      prefs.begin("batterySettings", false);
+      prefs.putBool("TWINGOSIM55DDRV", enable);
+      prefs.end();
+    }
+    request->send(200, "text/plain", "OK");
   });
 
   // Isolation monitor control (RoutineControl 0x2008). One setting, applied to both batteries.

@@ -33,18 +33,19 @@
 //     byte 3 = year bits (7:6) + second, byte 4 = month << 4, byte 5 = day << 3 + weekday (Monday = 0).
 //     The DATE is fixed (15.03.2025), only the time of day is real (NTP, local time incl. daylight
 //     saving). Until NTP has delivered a time the clock runs on from 12:00:00.
-//   - 0x350: the BCM vehicle state, every 100 ms like in the vehicle. In normal operation state C3
-//     (`C3 .. 14 14 96 45`, the state the vehicle holds while it is awake); the sleep sequence and the
-//     wake burst replace it while they run. Bytes 1-3 are a 24-bit "vehicle age" in minutes and are
-//     FIXED (see VEHICLE_AGE_350_B1..B3 below), also in the sleep/wake sequences.
+//   - 0x350: the vehicle state, every 100 ms like in the vehicle. In normal operation state C7 (`C7 .. 14 98
+//     94 45`, what the vehicle sends while it is ready to drive, taken from two real vehicle logs of
+//     02./03.10.); the sleep sequence and the wake burst replace it while they run. Bytes 1-3 are a 24-bit
+//     "vehicle age" in minutes since 15.02.2021 and are computed from the real time (see vehicle_age_minutes()
+//     below), also in the sleep/wake sequences.
 // Comment out the line below to disable both frames (and the NTP start) again.
 // ---------------------------------------------------------------------------
 #define TWINGO_TIME_FRAMES
 
 // ---------------------------------------------------------------------------
 // Two fast frames of the real vehicle that only run while it is awake (0x350 state C2..C7): 0x090 every
-// 10 ms and 0x242 every 20 ms, each with a rolling counter and a CRC-8 (poly 0x1D, start 0, final XOR
-// 0xF6 resp. 0x0A) - layout and CRC verified against three real vehicle logs. What they mean is unknown;
+// 10 ms and 0x242 every 20 ms, each with a rolling counter and a CRC-8 SAE J1850 (poly 0x1D, start 0xFF,
+// final XOR 0xFF, over all other bytes) - layout and CRC verified against the real vehicle logs. What they mean is unknown;
 // the payload is the most common one of the last vehicle log, sent constant. Like in the vehicle they stop
 // with the C0 stage of the sleep sequence and start again with the first C3 frame of the wake burst.
 // Comment out the line below to disable them again.
@@ -61,9 +62,9 @@
 
 class RenaultTwingoGen1Battery : public UdsCanBattery {
  public:
-  // /simulator page (02.10.): 27 cyclic signals, each individually toggleable. I = Installed, already sent
-  // for real elsewhere in this driver (the simulator checkbox for these just re-sends the same content as
-  // an extra, redundant frame - explicitly accepted, see the planning session). P = Planned, content below
+  // /simulator page (02.10.): 28 cyclic signals, each individually switchable. I = Installed, sent for real by
+  // other functions of this driver (since 03.10. the checkbox of an I row switches exactly that real
+  // sending on/off, see sim_enabled(); bit n of simulator_enabled_mask = row n). P = Planned, content below
   // taken verbatim from the steady-state/most-common frame observed in Log_Twingo_Ladung.log (02.10.
   // re-analysis). A = Assumed, meaning unconfirmed, but content is now ALSO taken from the same real log
   // (not fabricated) wherever the ID actually appears there - every one of the 27 below does. Interval_ms
@@ -79,6 +80,9 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
     char tag;  // 'I', 'P' or 'A'
     bool bms_origin;
     const char* label;
+    bool not_in_vehicle_log;  // "X": this ID does not occur at all in the real vehicle log (canmitlog.log, 02.10.)
+    const char* sender;       // sending ECU where a source exists (CanZE ZOE Ph1 table - not verified for the Twingo)
+    const char* info;         // what the value means - only what is confirmed, otherwise "meaning unknown"
   };
   static const uint8_t SIM_SIGNAL_COUNT = 28;  // 27 + 0x55D (02.10., real log, EVC->LBC direction assumed)
   static const SimSignal sim_signals[SIM_SIGNAL_COUNT];
@@ -86,6 +90,18 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   // "Read DTC details" (02.10., UNTESTED) - public so the webserver route can call it; implementation and
   // its backing state are private, see read_DTC() nearby in the .cpp for the matching pattern.
   void read_DTC_details();
+
+  // Free read request on the extended 29-bit protocol (03.10.), "More Battery Info" page: input field,
+  // Query button, answer field. Only read services are accepted (0x22 ReadDataByIdentifier, 0x19
+  // ReadDTCInformation). `hex` = request bytes as hex text (spaces allowed), e.g. "22925E". Returns "OK" when
+  // the request was started, otherwise a short reason. The answer is shown by user_query_result().
+  const char* start_user_query(const char* hex);
+  const char* user_query_result() const { return uq_result; }
+  const char* fdc_query_result() const { return fdc_result; }
+  // "Read DTC fault counters": UDS 0x19 0x14 (reportDTCFaultDetectionCounter), shown decoded.
+  void read_DTC_fdc();
+  // 0x350 / sleep / wake builders and the simulator rows ask this before sending (bit n = sim_signals[n]).
+  bool sim_enabled(uint8_t row);
 
   // Use this constructor for the second battery.
   RenaultTwingoGen1Battery(DATALAYER_BATTERY_TYPE* datalayer_ptr, CAN_Interface targetCan) : UdsCanBattery(targetCan) {
@@ -137,6 +153,7 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   virtual bool network_ready();                                // WiFi station connected
   virtual void start_ntp();                                    // configTzTime(), non-blocking
   virtual bool get_wall_clock_seconds_of_day(uint32_t& secs);  // false as long as the clock has not been set
+  virtual bool get_unix_time(time_t& now_utc);                 // UTC seconds, false as long as the clock is not set
 #endif
 
  private:
@@ -195,10 +212,19 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
                                    .ID = 0x69F,
                                    .data = {0x71, 0x30, 0x28, 0x2F}};
 
-  // 0x1F8/0x18A dynamic content (byte5 relay coupling / byte7 rolling counter) is now handled as a
-  // special case inside send_simulator_signals(), same mechanism as the 0x55D drive-mode override - see
-  // RENAULT-TWINGO-GEN1-BATTERY.cpp. sim_18a_counter replaces the old evc_heartbeat_18a_counter.
+  // Dynamic content of 0x1F8 / 0x18A / 0x42E is handled as special cases inside send_simulator_signals(),
+  // same mechanism as the 0x55D drive-mode override - see RENAULT-TWINGO-GEN1-BATTERY.cpp.
+  //  - 0x18A: byte 7 rolling counter (high nibble), byte 6 = CRC-8 J1850 over the other seven bytes.
+  //  - 0x42E: bytes 3/4 carry the measured pack voltage (0.5 V per bit); nothing is sent while it is unknown.
+  //  - 0x1F8: bits 40-50 (byte 5 + top 3 bits of byte 6) are the motor speed (10 rpm per bit). The vehicle
+  //    sends FA (invalid) first when the EVC starts, then 00 and a short fade 20,0E,06,03,01,00 (11 frames
+  //    in the log), then 0 (the car stands). Same here after every start of the transmission.
   uint8_t sim_18a_counter = 0x07;  // nibble index into the observed 0x70,0x80,...,0xF0,0x00... sequence
+  bool sim_1f8_running = false;    // false = the next 0x1F8 frame starts the FA / fade sequence again
+  unsigned long sim_1f8_start_ms = 0;
+  uint8_t sim_1f8_step = 0;
+  static const unsigned long SIM_1F8_INVALID_MS = 500;  // length of the FA phase (the log only shows >= 440 ms)
+  static const uint8_t SIM_1F8_FADE_STEPS = 10;
 
   unsigned long sim_last_send_ms[SIM_SIGNAL_COUNT] = {0};
   void send_simulator_signals(unsigned long currentMillis);
@@ -217,13 +243,16 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   // confirmed from any spec, only this timing correlation. Not sent outside the shutdown sequence.
   CAN_frame TWINGO_214_EVC_SLEEP_REQ = {.FD = false, .ext_ID = false, .DLC = 2, .ID = 0x214, .data = {0xF8, 0x3E}};
 
-  // 0x350 bytes 1-3: 24-bit "vehicle age" in minutes (in the real vehicle a counter that started around
-  // February 2021 and ticks once per minute). Fixed here: first day 15.03.2023 00:00 up to the faked
-  // date 15.03.2025 23:59 = 1,054,079 minutes = 0x10157F. Used by the normal 0x350 frame AND by the
-  // shutdown sequence / wake burst frames further down, so the battery never sees the value change.
-  static const uint8_t VEHICLE_AGE_350_B1 = 0x10;
-  static const uint8_t VEHICLE_AGE_350_B2 = 0x15;
-  static const uint8_t VEHICLE_AGE_350_B3 = 0x7F;
+  // 0x350 bytes 1-3: 24-bit "vehicle age" in minutes. In the real vehicle it counts real minutes: both vehicle
+  // logs (02.10. 16:48 and 03.10. 00:35 local) give the same zero point, 15.02.2021 11:13:08 UTC (unix
+  // 1613387588, spread of the individual counter steps -9/+14 s, so about +-15 s). The LBC stores the value
+  // (DID $9261 "Absolute Time of Vehicle"). Computed from the NTP time; as long as no real time is available
+  // it starts at the value of the build date and counts minutes since boot (then it jumps once, as soon as
+  // NTP delivers the real time). Used by the normal 0x350 frame AND by the shutdown sequence / wake burst.
+  static const uint32_t VEHICLE_AGE_EPOCH_UTC = 1613387588UL;
+  static const uint32_t VEHICLE_AGE_FALLBACK_START_MIN = 2960506UL;  // 03.10.2026 09:00 UTC
+  uint32_t vehicle_age_minutes(unsigned long nowMillis);
+  void fill_vehicle_age_350(uint8_t* b123, unsigned long nowMillis);  // 3 bytes, high byte first
 
 #ifdef TWINGO_TIME_FRAMES
   // Fixed date in 0x53B: 15.03.2025 was a Saturday (weekday 5 with Monday = 0), year bits = year - 2024.
@@ -240,12 +269,13 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
                                 .DLC = 6,
                                 .ID = 0x53B,
                                 .data = {0x00, 0x00, 0x06, 0x40, 0x30, 0x7D}};
+  // Run frame: state C7 like the vehicle while it is ready to drive; byte 4-7 = `14 98 94 45`, the most common
+  // value in both vehicle logs (877 of 1293 resp. 344 of 395 C7 frames). Bytes 1-3 (age) are set when sending.
   CAN_frame TWINGO_350_RUN = {.FD = false,
                               .ext_ID = false,
                               .DLC = 8,
                               .ID = 0x350,
-                              .data = {0xC3, VEHICLE_AGE_350_B1, VEHICLE_AGE_350_B2, VEHICLE_AGE_350_B3, 0x14, 0x14, 0x96,
-                                       0x45}};
+                              .data = {0xC7, 0x00, 0x00, 0x00, 0x14, 0x98, 0x94, 0x45}};
   bool ntp_started = false;
   bool time_fallback_started = false;
   unsigned long time_fallback_start_ms = 0;
@@ -258,8 +288,6 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
 #ifdef TWINGO_FAST_VEHICLE_FRAMES
   // 0x090 (7 bytes, 10 ms): b0 = 00, b1 = FF, b2 = E0 | 4-bit counter, b3 = CRC, b4..b6 = F0 7F F0.
   // 0x242 (8 bytes, 20 ms): b0 = 00, b1 = 4-bit counter << 3, b2..b6 = FF EF FE 00 0D, b7 = CRC.
-  static const uint8_t CRC_XOR_090 = 0xF6;
-  static const uint8_t CRC_XOR_242 = 0x0A;
   CAN_frame TWINGO_090_FAST = {.FD = false,
                                .ext_ID = false,
                                .DLC = 7,
@@ -570,9 +598,9 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
 
   // Vehicle-state broadcast (0x350), captured from a real AC-charge session (Log_Twingo_Ladung.log):
   // byte 0 is the BCM vehicle state (0xC3 BAT_TEMPO_LEVEL while active, 0xC2 CUT_OFF_PENDING, 0xC0
-  // SLEEPING, then 0x00), bytes 1-3 the 24-bit vehicle age (fixed here, see VEHICLE_AGE_350_B1..B3),
+  // SLEEPING, then 0x00), bytes 1-3 the 24-bit vehicle age (computed from the real time, see vehicle_age_minutes()),
   // byte 4/6 constant, bytes 5/7 depend on the state. In normal operation it is sent every 100 ms
-  // (TWINGO_TIME_FRAMES, awake state C3); the shutdown sequence and the wake burst below replace that
+  // (TWINGO_TIME_FRAMES, awake state C7); the shutdown sequence and the wake burst below replace that
   // frame while they run.
   void send_vehicle_state_350(uint8_t byte0);
   void send_wake_burst_frame(uint8_t index);  // 0 = the initial C0 frame, 1..10 = the ten C3 frames
@@ -628,8 +656,10 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
     DTC_EXT_READ_CMD_SENT,      // command frame sent, waiting for a reply or DTC_EXT_REPLY_TIMEOUT_MS
     DTC_EXT_ERASE_SESSION_SENT,
     DTC_EXT_ERASE_CMD_SENT,
-    DTC_EXT_DETAILS_SESSION_SENT,  // "Read DTC details" button (02.10., UNTESTED, see read_DTC_details())
-    DTC_EXT_DETAILS_CMD_SENT       // queries DTC_DETAILS_CODES[dtc_ext_details_index] in turn
+    DTC_EXT_DETAILS_SESSION_SENT,  // "Read DTC details" button (02.10., see read_DTC_details())
+    DTC_EXT_DETAILS_CMD_SENT,      // queries DTC_DETAILS_CODES[dtc_ext_details_index] in turn
+    DTC_EXT_USER_SESSION_SENT,     // free read request / fault counters (03.10.): session sent, waiting the gap
+    DTC_EXT_USER_CMD_SENT          // request sent, waiting for the (possibly multi-frame) reply
   };
   uint8_t dtc_ext_state = DTC_EXT_IDLE;
   unsigned long dtc_ext_step_start_ms = 0;
@@ -649,7 +679,29 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   static const uint8_t DTC_DETAILS_COUNT = 2;
   static const uint32_t DTC_DETAILS_CODES[DTC_DETAILS_COUNT];  // {0xE14381, 0x1B0715}, defined in the .cpp
   uint8_t dtc_ext_details_index = 0;
-  char dtc_ext_log_details[DTC_DETAILS_COUNT][80] = {"not run yet", "not run yet"};
+  char dtc_ext_log_details[DTC_DETAILS_COUNT][120] = {"not run yet", "not run yet"};
+
+  // One reply collector for the free read request, the fault counters (19 14) and the DTC details (19 06)
+  // (03.10.): handles single-frame replies and multi-frame replies of up to 256 bytes (own buffer, the
+  // 40-byte ext_isotp_buffer of the cell polling stays untouched), sends the ISO-TP flow control, ignores
+  // "response pending" (NRC 0x78) and fills the result text of the mode that started it.
+  enum UqMode : uint8_t { UQ_FREE = 0, UQ_FDC, UQ_DETAILS };
+  uint8_t uq_mode = UQ_FREE;
+  uint8_t uq_req[8] = {0};  // request bytes without the PCI byte
+  uint8_t uq_req_len = 0;
+  bool uq_needs_session = false;
+  uint8_t uq_buf[256] = {0};
+  uint16_t uq_buf_len = 0;       // bytes stored in uq_buf
+  uint16_t uq_expected_len = 0;  // bytes the reply announces (may exceed the buffer)
+  uint16_t uq_received_len = 0;  // bytes received so far (counts also the bytes that no longer fit)
+  bool uq_in_progress = false;   // a multi-frame reply is being collected
+  char uq_result[336] = "not run yet";
+  char fdc_result[336] = "not run yet";
+  bool uq_begin(uint8_t mode, const uint8_t* req, uint8_t len, bool needs_session);
+  void uq_send_request();
+  void handle_user_query_reply(const CAN_frame& f);
+  void uq_reply_complete();
+  void uq_restore_poll_template();
   void handle_dtc_ext(unsigned long currentMillis);
   void handle_dtc_ext_reply(CAN_frame rx_frame);
   void handle_dtc_read_response(const uint8_t* data, uint16_t len);

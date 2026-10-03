@@ -23,8 +23,17 @@ class TestTwingo : public RenaultTwingoGen1Battery {
   int ntp_starts = 0;
   bool clock_set = false;
   uint32_t clock_secs = 0;
+  bool unix_set = false;   // vehicle age (0x350 bytes 1-3) is computed from this UTC time
+  time_t unix_now = 0;
 
   bool network_ready() override { return network_up; }
+  bool get_unix_time(time_t& now_utc) override {
+    if (!unix_set) {
+      return false;
+    }
+    now_utc = unix_now;
+    return true;
+  }
   void start_ntp() override { ntp_starts++; }
   bool get_wall_clock_seconds_of_day(uint32_t& secs) override {
     if (!clock_set) {
@@ -92,6 +101,19 @@ uint32_t secs(uint32_t h, uint32_t m, uint32_t s) {
   return h * 3600 + m * 60 + s;
 }
 
+// Zero point of the vehicle age counter (0x350 bytes 1-3): 15.02.2021 11:13:08 UTC.
+const time_t AGE_EPOCH = 1613387588;
+// UTC time at which the vehicle age is `minutes` (plus a few seconds into the minute).
+time_t unix_for_age(uint32_t minutes, uint32_t extra_secs = 5) {
+  return AGE_EPOCH + (time_t)minutes * 60 + (time_t)extra_secs;
+}
+// The three age bytes of 0x350 for a minute value.
+void age_bytes(uint32_t minutes, uint8_t out[3]) {
+  out[0] = (uint8_t)(minutes >> 16);
+  out[1] = (uint8_t)(minutes >> 8);
+  out[2] = (uint8_t)minutes;
+}
+
 CAN_frame frame_424(int t_min_c, int t_max_c) {
   CAN_frame f = {};
   f.DLC = 8;
@@ -133,6 +155,8 @@ TEST(TwingoTimeFramesTests, ClockFrameCarriesRealTimeAndFixedDate) {
   b.setup();
   b.clock_set = true;
   b.clock_secs = secs(10, 43, 11);
+  b.unix_set = true;
+  b.unix_now = unix_for_age(2959882);
   auto frames = tick(b, 1000);
   auto f53b = with_id(frames, 0x53B);
   ASSERT_EQ(f53b.size(), 1u);
@@ -140,7 +164,8 @@ TEST(TwingoTimeFramesTests, ClockFrameCarriesRealTimeAndFixedDate) {
   EXPECT_TRUE(bytes_are(f53b[0], {0x50, 0xAC, 0x06, 0x4B, 0x30, 0x7D}));
   auto f350 = with_id(frames, 0x350);
   ASSERT_EQ(f350.size(), 1u);
-  EXPECT_TRUE(bytes_are(f350[0], {0xC3, 0x10, 0x15, 0x7F, 0x14, 0x14, 0x96, 0x45}));  // state C3, fixed age
+  // state C7 like the vehicle while it is ready to drive, age 2959882 min = 0x2D2A0A (value of the real log)
+  EXPECT_TRUE(bytes_are(f350[0], {0xC7, 0x2D, 0x2A, 0x0A, 0x14, 0x98, 0x94, 0x45}));
 }
 
 TEST(TwingoTimeFramesTests, ClockFrameOncePerSecondAndRunFrameEvery100ms) {
@@ -224,21 +249,23 @@ TEST(TwingoTimeFramesTests, NtpIsStartedOnceAsSoonAsTheNetworkIsUp) {
 // Sleep / wake sequence: fixed 0x350 age, 0x53B follows the other own frames
 // ---------------------------------------------------------------------------
 
-TEST(TwingoTimeFramesTests, SleepAndWakeSequenceUseTheFixedVehicleAge) {
+TEST(TwingoTimeFramesTests, SleepAndWakeSequenceUseTheVehicleAgeFromTheClock) {
   reset_datalayer_temperatures();
   TestTwingo b;
   b.setup();
   b.clock_set = true;
   b.clock_secs = secs(12, 0, 0);
+  b.unix_set = true;
+  b.unix_now = unix_for_age(2959882);  // frozen clock: every 0x350 of the whole run shows the same age
   std::vector<Tx> log;
   uint64_t t = 1000;
   for (; t < 5000; t += 100) {
     tick_log(b, t, log);
   }
-  // Normal operation so far: the "C3" run frame every 100 ms.
+  // Normal operation so far: the "C7" run frame every 100 ms.
   ASSERT_FALSE(with_id(log, 0x350).empty());
   for (const Tx& x : with_id(log, 0x350)) {
-    EXPECT_TRUE(bytes_are(x.f, {0xC3, 0x10, 0x15, 0x7F, 0x14, 0x14, 0x96, 0x45}));
+    EXPECT_TRUE(bytes_are(x.f, {0xC7, 0x2D, 0x2A, 0x0A, 0x14, 0x98, 0x94, 0x45}));
   }
 
   // A plausible temperature frame ends the boot phase of the temperature filter before the sleep run.
@@ -258,10 +285,10 @@ TEST(TwingoTimeFramesTests, SleepAndWakeSequenceUseTheFixedVehicleAge) {
   bool seen_c3 = false, seen_c2 = false, seen_c0 = false, seen_00 = false;
   uint64_t t_first_00 = 0, t_last_350 = 0;
   for (const Tx& x : f350) {
-    // Every 0x350 frame of the sequence carries the same fixed age in bytes 1-3, no counter, no "26 64".
-    EXPECT_EQ(x.f.data.u8[1], 0x10);
-    EXPECT_EQ(x.f.data.u8[2], 0x15);
-    EXPECT_EQ(x.f.data.u8[3], 0x7F);
+    // Every 0x350 frame of the sequence carries the age of the (frozen) clock in bytes 1-3.
+    EXPECT_EQ(x.f.data.u8[1], 0x2D);
+    EXPECT_EQ(x.f.data.u8[2], 0x2A);
+    EXPECT_EQ(x.f.data.u8[3], 0x0A);
     uint8_t s = x.f.data.u8[0];
     seen_c3 |= (s == 0xC3);
     seen_c2 |= (s == 0xC2);
@@ -273,8 +300,8 @@ TEST(TwingoTimeFramesTests, SleepAndWakeSequenceUseTheFixedVehicleAge) {
     t_last_350 = x.t;
   }
   EXPECT_TRUE(seen_c3 && seen_c2 && seen_c0 && seen_00);
-  // The C3 stage of the sequence has bytes 5/7 = 14/45, exactly like the run frame; no second stream next to
-  // it: about 10 frames per second during the C3 stage (the run frame is suppressed while the sequence runs).
+  // The C3 stage of the sequence has bytes 5/7 = 14/45; no second stream next to it: about 10 frames per
+  // second during the C3 stage (the run frame is suppressed while the sequence runs).
   uint32_t c3_frames = 0;
   for (const Tx& x : f350) {
     if (x.f.data.u8[0] == 0xC3) {
@@ -296,7 +323,7 @@ TEST(TwingoTimeFramesTests, SleepAndWakeSequenceUseTheFixedVehicleAge) {
     EXPECT_LE(x.t, t_last_350 + 0) << "frame after the last 0x350 of the sequence: ID 0x" << std::hex << x.f.ID;
   }
 
-  // Wake up: first the burst (C0 once, then C3 x10) with the same fixed age, while 0x53B is back at once.
+  // Wake up: first the burst (C0 once, then C3 x10) with the same age from the frozen clock, while 0x53B is back at once.
   std::vector<Tx> wake_log;
   b.request_wake_up();
   uint64_t wake_start = t;
@@ -318,18 +345,18 @@ TEST(TwingoTimeFramesTests, SleepAndWakeSequenceUseTheFixedVehicleAge) {
     }
   }
   ASSERT_EQ(burst.size(), 11u);
-  EXPECT_TRUE(bytes_are(burst[0].f, {0xC0, 0x10, 0x15, 0x7F, 0x14, 0x70, 0x96, 0x85}));
+  EXPECT_TRUE(bytes_are(burst[0].f, {0xC0, 0x2D, 0x2A, 0x0A, 0x14, 0x70, 0x96, 0x85}));
   for (size_t i = 1; i < burst.size(); i++) {
     EXPECT_EQ(burst[i].f.data.u8[0], 0xC3);
-    EXPECT_EQ(burst[i].f.data.u8[1], 0x10);
-    EXPECT_EQ(burst[i].f.data.u8[2], 0x15);
-    EXPECT_EQ(burst[i].f.data.u8[3], 0x7F);
+    EXPECT_EQ(burst[i].f.data.u8[1], 0x2D);
+    EXPECT_EQ(burst[i].f.data.u8[2], 0x2A);
+    EXPECT_EQ(burst[i].f.data.u8[3], 0x0A);
   }
   auto wake53b = with_id(wake_log, 0x53B);
   ASSERT_FALSE(wake53b.empty());
   EXPECT_LE(wake53b.front().t, wake_start + 1200);
 
-  // After the burst the normal "C3" run frame is back, every 100 ms.
+  // After the burst the normal "C7" run frame is back, every 100 ms.
   std::vector<Tx> after_log;
   for (uint64_t end = t + 4000; t < end; t += 100) {
     tick_log(b, t, after_log);
@@ -338,7 +365,7 @@ TEST(TwingoTimeFramesTests, SleepAndWakeSequenceUseTheFixedVehicleAge) {
   ASSERT_GE(run350.size(), 38u);
   ASSERT_LE(run350.size(), 41u);
   for (const Tx& x : run350) {
-    EXPECT_TRUE(bytes_are(x.f, {0xC3, 0x10, 0x15, 0x7F, 0x14, 0x14, 0x96, 0x45}));
+    EXPECT_TRUE(bytes_are(x.f, {0xC7, 0x2D, 0x2A, 0x0A, 0x14, 0x98, 0x94, 0x45}));
   }
 
   // After the wake-up the BMS behaves like after a boot: the temperature filter is armed again, an implausible
@@ -488,7 +515,10 @@ TEST(TwingoTimeFramesTests, TimePidsAreInThePollList) {
   }
   EXPECT_TRUE(pids.count(0x9261) == 1);
   EXPECT_TRUE(pids.count(0x91C1) == 1);
-  EXPECT_EQ(pids.size(), 135u);  // 96 cells + 23 others + 16 new display-only PIDs, one request every 200 ms
+  // 96 cells + 23 others + 16 new display-only PIDs + the display-only battery current 0x900D = 136 poll
+  // targets, one request every 200 ms (see the comment at ext_poll_list in the header)
+  EXPECT_EQ(pids.size(), 136u);
+  EXPECT_TRUE(pids.count(0x900D) == 1);
   EXPECT_GE(requests, 119u);
 }
 
@@ -913,10 +943,10 @@ TEST(TwingoNewDisplayPidsTests, NewPidsAreInThePollListAndNoneAreDuplicated) {
     }
   }
   for (uint16_t pid : {0x91CFu, 0x925Fu, 0x9011u, 0x9006u, 0x9007u, 0x9009u, 0x9008u, 0x900Au, 0x9003u, 0x9018u,
-                       0x900Eu, 0x900Fu, 0x9001u, 0x9002u, 0x91B9u, 0x91BAu}) {
+                       0x900Eu, 0x900Fu, 0x9001u, 0x9002u, 0x91B9u, 0x91BAu, 0x900Du}) {
     EXPECT_EQ(pids.count(pid), 1u) << "PID 0x" << std::hex << pid;
   }
-  EXPECT_EQ(pids.size(), 135u);
+  EXPECT_EQ(pids.size(), 136u);  // 135 + the battery current 0x900D
 }
 
 TEST(TwingoNewDisplayPidsTests, NewPidsNotFedIntoDatalayer) {

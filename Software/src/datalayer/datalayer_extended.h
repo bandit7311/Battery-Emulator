@@ -265,7 +265,7 @@ struct DATALAYER_INFO_TWINGO_GEN1 {
   /** Status mask for the next read_DTC() call - 0x09 (Active/Confirmed, default) or 0xFF (all statuses,
    *  same mask an external ELM tool used successfully: 01.10., confirmed 183 entries, 7 non-zero incl.
    *  all 6 already-known DTCs). Settable on "More Battery Info" via a checkbox, NOT persisted to NVM. */
-  uint8_t dtc_ext_read_mask = 0x09;
+  uint8_t dtc_ext_read_mask;  // non-zero default set explicitly in the constructor below (memset(0))
 };
 
 struct DATALAYER_INFO_CELLPOWER {
@@ -1114,6 +1114,7 @@ class DataLayerExtended {
     twingoGen1.sleep_failsafe_minutes = 30;
     twingoGen1.cellwatch_cell = 1;
     twingoGen1.simulator_enabled_mask = 0x000003FF;  // the 10 "I" signals on, see sim_signals[0..9]
+    twingoGen1.dtc_ext_read_mask = 0x09;  // Active/Confirmed - memset(0) above would otherwise leave 0x00
   }
 };
 

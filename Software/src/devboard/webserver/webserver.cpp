@@ -857,6 +857,30 @@ void init_webserver() {
     request->send(200, "text/plain", "OK");
   });
 
+  // Free read request on "More Battery Info" (03.10.): the Twingo build only, same cast caveat as
+  // /triggerTwingoDtcDetails above. Only the read services 0x22/0x19 are accepted by start_user_query().
+  def_route_with_auth("/twingoQuery", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    const char* msg = "missing request";
+    if (request->hasParam("hex")) {
+      msg = static_cast<RenaultTwingoGen1Battery*>(battery)->start_user_query(
+          request->getParam("hex")->value().c_str());
+    }
+    request->send(200, "text/plain", msg);
+  });
+
+  // Answer of the free read request (which=free) or of the fault counters (which=fdc), polled by the page.
+  def_route_with_auth("/twingoQueryResult", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    RenaultTwingoGen1Battery* twingo = static_cast<RenaultTwingoGen1Battery*>(battery);
+    bool fdc = request->hasParam("which") && request->getParam("which")->value() == "fdc";
+    request->send(200, "text/plain", fdc ? twingo->fdc_query_result() : twingo->user_query_result());
+  });
+
+  // "Read DTC fault counters" button: UDS 0x19 0x14.
+  def_route_with_auth("/triggerTwingoDtcFdc", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    static_cast<RenaultTwingoGen1Battery*>(battery)->read_DTC_fdc();
+    request->send(200, "text/plain", "OK");
+  });
+
   // EXPERIMENTAL rest/active toggle for 0x55D - not persisted, runtime only. The rising/falling edge is
   // detected in send_simulator_signals() itself (compares against sim_55d_rest_active_prev), this route
   // only writes the raw checkbox value.

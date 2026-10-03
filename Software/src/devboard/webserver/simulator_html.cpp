@@ -20,6 +20,10 @@ static void append_signal_row(String& content, uint8_t i) {
 
   content += "<td>" + String(s.interval_ms) + " ms</td>";
 
+  // "X" = this ID never occurs in the real vehicle log (canmitlog.log, 02.10.)
+  content += s.not_in_vehicle_log ? "<td><span class='tag-x' title='never seen in the real vehicle log'>X</span></td>"
+                                  : "<td></td>";
+
   content += "<td>" + String(s.label);
   if (s.bms_origin) {
     content +=
@@ -27,9 +31,9 @@ static void append_signal_row(String& content, uint8_t i) {
         "note)</span>";
   }
   if (s.tag == 'I') {
-    content += " <span class='note'>(already sent for real elsewhere in this driver)</span>";
+    content += " <span class='note'>(sent for real by this driver - this checkbox switches that sending)</span>";
   }
-  content += "</td></tr>";
+  content += "</td><td>" + String(s.sender) + "</td><td class='info'>" + String(s.info) + "</td></tr>";
 }
 
 String simulator_processor(const String& var) {
@@ -37,59 +41,38 @@ String simulator_processor(const String& var) {
     String content = "";
     content += "<style>";
     content += "body { background-color: black; color: white; font-family: sans-serif; }";
-    content += "table { border-collapse: collapse; width: 100%; max-width: 820px; }";
+    content += "table { border-collapse: collapse; width: 100%; max-width: 1200px; }";
     content += "td, th { border: 1px solid #444; padding: 4px 8px; text-align: left; }";
     content += "th { text-align: center; }";
     content += ".tag-i { color: #6fcf6f; font-weight: bold; }";
     content += ".tag-p { color: #ffd479; font-weight: bold; }";
     content += ".tag-a { color: #ff9b9b; font-weight: bold; }";
     content += ".note { color: #999; font-size: 0.85em; }";
+    content += ".tag-x { color: #ff5c5c; font-weight: bold; }";
+    content += ".info { color: #bbb; font-size: 0.9em; }";
     content += "h3 { margin-top: 24px; margin-bottom: 6px; }";
     content += "</style>";
 
     content += "<h2>CAN Signal Simulator</h2>";
     content +=
-        "<p>28 cyclic signals a real vehicle sends on this bus. Each checkbox is independent. Content for "
-        "every row below comes from a real capture (Log_Twingo_Ladung.log, 02.10.), not invented.</p>";
+        "<p>28 cyclic signals. Each checkbox is independent and switches exactly that signal on or off, "
+        "including the 10 signals this driver sends by itself (I). Content comes from real captures "
+        "(Log_Twingo_Ladung.log, canmitlog.log), not invented. The sender is the ECU named in the CanZE table "
+        "(not verified for the Twingo), \"meaning unknown\" means exactly that.</p>";
     content +=
         "<p><b>Legend:</b> <span class='tag-i'>I</span> = Installed, already sent for real by this "
         "driver &nbsp; <span class='tag-p'>P</span> = Planned, content/meaning from the real log, not yet "
         "sent &nbsp; <span class='tag-a'>A</span> = Assumed, content from the real log but meaning "
-        "unconfirmed</p>";
+        "unconfirmed &nbsp; <span class='tag-x'>X</span> = this ID never occurs in the real Twingo vehicle log "
+        "(canmitlog.log, 02.10.)</p>";
 
-    content += "<details style='margin-bottom:16px;'><summary style='cursor:pointer;color:#8fd3ff;'>Full list with startup state and sender</summary>";
-    content += "<div style='padding:8px 0;'>";
+    content +=
+        "<p>&#9745; = on by default (these are the 10 signals this driver already sent before the simulator existed) "
+        "&nbsp; &#9744; = off by default (needs a deliberate click)</p>";
 
-    content += "<p><b>10 ms:</b><br>"
-               "&#9745; 0x090 (Twingo-Fast, counter+CRC)<br>"
-               "&#9744; 0x1F8 (EVC, heartbeat + relay byte)<br>"
-               "&#9744; 0x18A (EVC, rolling counter byte 7)<br>"
-               "&#9744; 0x17A, 0x17E, 0x186, 0x1F6 (BMS&rarr;EVC, burst packet, content unknown)</p>";
-
-    content += "<p><b>20 ms:</b><br>"
-               "&#9745; 0x242 (Twingo-Fast, counter+CRC)<br>"
-               "&#9745; 0x214 (shutdown only)<br>"
-               "&#9744; 0x211 (EVC, Klemme15/driving)<br>"
-               "&#9744; 0x1B0 (EVC, inter-ECU sync, content known: FF 2C FF C0)<br>"
-               "&#9744; 0x217 (BMS, charge/discharge limits, content known from log)</p>";
-
-    content += "<p><b>100 ms:</b><br>"
-               "&#9745; 0x350 (vehicle state, C0)<br>"
-               "&#9745; 0x19F, 0x426, 0x436, 0x423 (upstream PR #2907)<br>"
-               "&#9744; 0x5DE, 0x5DF, 0x634 (thermal management)<br>"
-               "&#9744; 0x427, 0x42E, 0x432, 0x650, 0x1FD (SOC/SOH/odometer/energy - measured at 100ms "
-               "in the real log, not 1000ms as originally assumed)<br>"
-               "&#9744; 0x55D (EVC, assumed - see its own row for the experimental drive-mode variant)</p>";
-
-    content += "<p><b>1000 ms:</b><br>"
-               "&#9745; 0x69F (upstream PR #2907)<br>"
-               "&#9745; 0x53B (time frame)</p>";
-
-    content += "<p>&#9745; = on by default (already sent for real today) &nbsp; &#9744; = off by default "
-               "(new, needs a deliberate click)</p>";
-    content += "</div></details>";
-
-    content += "<table><thead><tr><th>On</th><th>ID</th><th>Tag</th><th>Interval</th><th>Signal</th></tr></thead><tbody>";
+    content +=
+        "<table><thead><tr><th>On</th><th>ID</th><th>Tag</th><th>Interval</th><th>In car log</th><th>Signal</th>"
+        "<th>Sender</th><th>Meaning</th></tr></thead><tbody>";
 
     // Display grouped by interval (10/20/100/1000ms), even though the underlying table/NVM bit order is
     // not sorted that way - a simple stable selection sort over interval_ms, operating on original

@@ -92,6 +92,7 @@ add_executable(tests
     ../Software/src/devboard/utils/time_format.cpp
     ../Software/src/devboard/utils/common_functions.cpp
     ../Software/src/devboard/utils/led_handler.cpp
+    ../Software/src/devboard/webserver/simulator_html.cpp
     ../Software/src/lib/adafruit-Adafruit_NeoPixel/Adafruit_NeoPixel.cpp
     emul/neopixel_show.cpp
     ../Software/src/datalayer/datalayer.cpp

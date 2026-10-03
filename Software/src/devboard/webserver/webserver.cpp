@@ -816,6 +816,14 @@ void init_webserver() {
     request->send(200, "text/html", index_html, simulator_processor);
   });
 
+  // Steady 0x350 frame: C7 (value=0, default) or C3 (value=1), runtime only (03.10.).
+  def_route_with_auth("/editTwingoSteady350", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("value")) {
+      RenaultTwingoGen1Battery::steady_350_use_c3 = request->getParam("value")->value().toInt() != 0;
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
   // One checkbox toggles one bit of simulator_enabled_mask, persisted to NVM as a single uint32.
   def_route_with_auth("/editTwingoSimSignal", server, HTTP_GET, [](AsyncWebServerRequest* request) {
     if (request->hasParam("index") && request->hasParam("value")) {

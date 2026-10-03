@@ -41,7 +41,7 @@ String simulator_processor(const String& var) {
     String content = "";
     content += "<style>";
     content += "body { background-color: black; color: white; font-family: sans-serif; }";
-    content += "table { border-collapse: collapse; width: 100%; max-width: 1200px; }";
+    content += "table { border-collapse: collapse; width: 1200px; max-width: 97vw; }";
     content += "td, th { border: 1px solid #444; padding: 4px 8px; text-align: left; }";
     content += "th { text-align: center; }";
     content += ".tag-i { color: #6fcf6f; font-weight: bold; }";
@@ -69,6 +69,16 @@ String simulator_processor(const String& var) {
     content +=
         "<p>&#9745; = on by default (these are the 10 signals this driver already sent before the simulator existed) "
         "&nbsp; &#9744; = off by default (needs a deliberate click)</p>";
+
+    // Steady 0x350 frame: C7 (like the vehicle while ready to drive) or C3 (old value), runtime only, not saved.
+    content += "<p><b>0x350 steady frame:</b> <label><input type='radio' name='steady350' id='steady350c7' ";
+    content += RenaultTwingoGen1Battery::steady_350_use_c3 ? "" : "checked ";
+    content += "onclick=\"fetch('/editTwingoSteady350?value=0')\"> C7 (like the car, default)</label> &nbsp; ";
+    content += "<label><input type='radio' name='steady350' id='steady350c3' ";
+    content += RenaultTwingoGen1Battery::steady_350_use_c3 ? "checked " : "";
+    content += "onclick=\"fetch('/editTwingoSteady350?value=1')\"> C3 (old value, for diagnostic tests)</label> ";
+    content += "<span class='note'>- runtime only, back to C7 after a restart; the checkbox of row 0x350 below switches the "
+               "frame on or off, sleep and wake-up send their own 0x350</span></p>";
 
     content +=
         "<table><thead><tr><th>On</th><th>ID</th><th>Tag</th><th>Interval</th><th>In car log</th><th>Signal</th>"

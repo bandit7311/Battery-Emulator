@@ -450,14 +450,14 @@ TEST(TwingoTimeFramesTests, Soh658IsShownAsCandidate) {
   b.setup();
   EXPECT_TRUE(contains(b.get_uds_info_html(), "SOH candidate (0x658 byte 4): not received"));
   b.handle_incoming_can_frame(frame_658(0x5F));
-  EXPECT_TRUE(contains(b.get_uds_info_html(), "SOH candidate (0x658 byte 4): 95 %"));
+  EXPECT_TRUE(contains(b.get_uds_info_html(), "SOH candidate (0x658 byte 4): 95 &#37;"));
   b.handle_incoming_can_frame(frame_658(0x60));
-  EXPECT_TRUE(contains(b.get_uds_info_html(), "SOH candidate (0x658 byte 4): 96 %"));
+  EXPECT_TRUE(contains(b.get_uds_info_html(), "SOH candidate (0x658 byte 4): 96 &#37;"));
   b.handle_incoming_can_frame(frame_658(0x7F));
   EXPECT_TRUE(contains(b.get_uds_info_html(), "SOH candidate (0x658 byte 4): invalid (127)"));
   // The top bit is masked away like in OVMS (0xE0 & 0x7F = 96).
   b.handle_incoming_can_frame(frame_658(0xE0));
-  EXPECT_TRUE(contains(b.get_uds_info_html(), "SOH candidate (0x658 byte 4): 96 %"));
+  EXPECT_TRUE(contains(b.get_uds_info_html(), "SOH candidate (0x658 byte 4): 96 &#37;"));
 }
 
 TEST(TwingoTimeFramesTests, Soh658IsNotUsedForTheDatalayerSoh) {
@@ -909,7 +909,7 @@ TEST(TwingoNewDisplayPidsTests, SohAndPowerLimitsFormula) {
   b.handle_incoming_can_frame(uds_reply(0x900E, {0x10, 0xCC}));   // 43 kW
   b.handle_incoming_can_frame(uds_reply(0x900F, {0x1C, 0x20}));   // 72 kW
   String html = b.get_uds_info_html();
-  EXPECT_TRUE(contains(html, "Battery SOH avg (0x9003): 95.890 %"));
+  EXPECT_TRUE(contains(html, "Battery SOH avg (0x9003): 95.890 &#37;"));
   EXPECT_TRUE(contains(html, "Max Charge Power (0x9018): 14.190 kW"));
   EXPECT_TRUE(contains(html, "Max Generated Power (0x900E): 43.000 kW"));
   EXPECT_TRUE(contains(html, "Max Available Power (0x900F): 72.000 kW"));
@@ -924,10 +924,10 @@ TEST(TwingoNewDisplayPidsTests, SocFormulaWithOffset) {
   b.handle_incoming_can_frame(uds_reply(0x91BA, {0x1B, 0xC5}));  // 68.09 %
   b.handle_incoming_can_frame(uds_reply(0x9002, {0x17, 0xDA}));  // 61.06 % (dashboard SOC, no offset)
   String html = b.get_uds_info_html();
-  EXPECT_TRUE(contains(html, "Battery SOC, internal (0x9001): 64.820 %"));
-  EXPECT_TRUE(contains(html, "Battery SOC min (0x91B9): 67.280 %"));
-  EXPECT_TRUE(contains(html, "Battery SOC max (0x91BA): 68.090 %"));
-  EXPECT_TRUE(contains(html, "Battery USOC, dashboard (0x9002, display only): 61.060 %"));
+  EXPECT_TRUE(contains(html, "Battery SOC, internal (0x9001): 64.820 &#37;"));
+  EXPECT_TRUE(contains(html, "Battery SOC min (0x91B9): 67.280 &#37;"));
+  EXPECT_TRUE(contains(html, "Battery SOC max (0x91BA): 68.090 &#37;"));
+  EXPECT_TRUE(contains(html, "Battery USOC, dashboard (0x9002, display only): 61.060 &#37;"));
 }
 
 TEST(TwingoNewDisplayPidsTests, NewPidsAreInThePollListAndNoneAreDuplicated) {

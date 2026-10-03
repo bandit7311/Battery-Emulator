@@ -2,6 +2,7 @@
 #include "../datalayer/datalayer.h"
 #include "../datalayer/datalayer_extended.h"
 #include <stdarg.h>
+#include <string.h>
 #include "../devboard/utils/common_functions.h"  // crc8_table_SAE_J1850_ZER0
 #include "../devboard/utils/events.h"
 #include "../devboard/utils/logging.h"
@@ -544,9 +545,11 @@ void RenaultTwingoGen1Battery::handle_extended_reply(CAN_frame rx_frame) {
   datalayer_battery->status.CAN_battery_still_alive = CAN_STILL_ALIVE;
 
   if (dtc_ext_state == DTC_EXT_USER_CMD_SENT || dtc_ext_state == DTC_EXT_DETAILS_CMD_SENT) {
-    // Free read request / fault counters / DTC details: own collector with a 256-byte buffer (03.10.).
-    handle_user_query_reply(rx_frame);
-    return;
+    // Free read request / fault counters / DTC details: own collector with a 256-byte buffer (03.10.). Only the
+    // reply to our request is taken; any other frame continues below like a normal frame.
+    if (handle_user_query_reply(rx_frame)) {
+      return;
+    }
   }
 
   uint8_t pci = rx_frame.data.u8[0];
@@ -1130,7 +1133,7 @@ void RenaultTwingoGen1Battery::append_live_html(String& s) {
     s += "invalid (127)";
   } else {
     s += String(soh_658);
-    s += " %";
+    s += " &#37;";  // never a raw percent sign in this page, see append_ext_value()
   }
   s += "<br>";
   append_ext_value(s, "Pack Mileage (0x91CF)", ext_mileage_pack, (ext_mileage_pack.raw ^ 0x80000000u) / 32.0, "km");
@@ -1168,7 +1171,21 @@ void RenaultTwingoGen1Battery::append_ext_value(String& s, const char* label, co
   s += String(value, 3);
   if (unit[0] != '\0') {
     s += " ";
-    s += unit;
+    // A raw '%' must never appear in this page: the web server's template engine takes the text between two '%'
+    // for a placeholder and swallows it (03.10.: it ate the NVROL / DTC block with the "Read ALL DTC statuses"
+    // checkbox and the DTC table head). "&#37;" is decoded by the browser, the template engine ignores it.
+    char escaped[40];  // the units are short ("kW", "km", "%"); built in a buffer, String += char differs per core
+    size_t n = 0;
+    for (const char* p = unit; *p != '\0' && n + 6 < sizeof(escaped); p++) {
+      if (*p == '%') {
+        memcpy(&escaped[n], "&#37;", 5);
+        n += 5;
+      } else {
+        escaped[n++] = *p;
+      }
+    }
+    escaped[n] = '\0';
+    s += escaped;
   }
   s += "<br>";
 }
@@ -1761,6 +1778,8 @@ void RenaultTwingoGen1Battery::send_time_frames(unsigned long currentMillis) {
 // The 0x350 run frame (state C7 like the vehicle while it is ready to drive, every 100 ms), called from the
 // 100 ms block of transmit_can(). During the shutdown sequence and the wake burst those send their own 0x350
 // (that is the sleep/wake protocol itself, the /simulator checkbox only switches this steady frame).
+bool RenaultTwingoGen1Battery::steady_350_use_c3 = false;
+
 void RenaultTwingoGen1Battery::send_run_350() {
 #ifdef TWINGO_EXTENDED_CELL_POLLING
   if (NVROLstateMachine == 7 || NVROLstateMachine == 8) {
@@ -1771,6 +1790,10 @@ void RenaultTwingoGen1Battery::send_run_350() {
     return;  // /simulator row 0x350 switched off
   }
   fill_vehicle_age_350(&TWINGO_350_RUN.data.u8[1], millis());
+  TWINGO_350_RUN.data.u8[0] = steady_350_use_c3 ? 0xC3 : 0xC7;
+  TWINGO_350_RUN.data.u8[5] = steady_350_use_c3 ? 0x14 : 0x98;
+  TWINGO_350_RUN.data.u8[6] = steady_350_use_c3 ? 0x96 : 0x94;
+  TWINGO_350_RUN.data.u8[7] = 0x45;
   transmit_can_frame(&TWINGO_350_RUN);
 }
 #endif  // TWINGO_TIME_FRAMES
@@ -1879,7 +1902,7 @@ const RenaultTwingoGen1Battery::SimSignal RenaultTwingoGen1Battery::sim_signals[
      "Gear in byte 6 (00 P, 10 R, 20 N, 70 D) according to the OVMS RT32 code."},
     {0x186, 7, {0, 0, 0x32, 0x03, 0x20, 0, 0x20, 0}, 10, 'A', true, "0x186", false,
      "EVC (CanZE)",
-     "Bits 16-27 = torque setpoint (0.5 N*m per bit, offset 800, equals PEB $2003), bits 40-49 = throttle (0.125 % per bit), bits 28-39 unknown. Content = standing."},
+     "Bits 16-27 = torque setpoint (0.5 N*m per bit, offset 800, equals PEB $2003), bits 40-49 = throttle (0.125 percent per bit), bits 28-39 unknown. Content = standing."},
     {0x1F6, 8, {0x1E, 0, 0xC0, 0x1D, 0, 0xFF, 0xFF, 0xFF}, 10, 'A', true, "0x1F6 (byte3 varies)", false,
      "EVC (CanZE)",
      "Only 7 different frames in the vehicle log, byte 3 a slow value (0x35/0x36). Meaning unknown."},
@@ -2690,14 +2713,39 @@ void RenaultTwingoGen1Battery::uq_reply_complete() {
   dtc_ext_state = DTC_EXT_IDLE;
 }
 
+// Does this reply belong to the request of uq_begin()? p = payload starting with the SID, n = number of payload
+// bytes available (single frame: all, First Frame: the first 6). Positive: SID = request SID + 0x40 and, for 0x22,
+// the first requested DID / for 0x19 the sub-function is echoed. Negative: 7F and the requested SID is ours.
+// Everything else - the "50 03 ..." confirmation of the session we opened, a late reply of the cell polling
+// ("62 90 72 ...") - does not belong to the request (03.10.: both were shown as the answer before).
+bool RenaultTwingoGen1Battery::uq_reply_matches(const uint8_t* p, uint8_t n) const {
+  if (n < 2 || uq_req_len < 1) {
+    return false;
+  }
+  if (p[0] == 0x7F) {
+    return n >= 3 && p[1] == uq_req[0];
+  }
+  if (p[0] != (uint8_t)(uq_req[0] + 0x40)) {
+    return false;
+  }
+  if (uq_req[0] == 0x22) {
+    return n >= 3 && uq_req_len >= 3 && p[1] == uq_req[1] && p[2] == uq_req[2];
+  }
+  if (uq_req[0] == 0x19) {
+    return uq_req_len >= 2 && p[1] == uq_req[1];
+  }
+  return false;
+}
+
 // Collects the reply to the request of uq_begin(): single frame, or First Frame (flow control sent here) plus
-// Consecutive Frames. "Response pending" (NRC 0x78) only restarts the timeout.
-void RenaultTwingoGen1Battery::handle_user_query_reply(const CAN_frame& f) {
+// Consecutive Frames. "Response pending" (NRC 0x78) only restarts the timeout. Returns false for a frame that is
+// not the reply to this request; the caller then handles it like any other frame (cell polling etc.).
+bool RenaultTwingoGen1Battery::handle_user_query_reply(const CAN_frame& f) {
   uint8_t pci = f.data.u8[0];
   if (pci < 0x10) {
     uint8_t len = pci;
-    if (len == 0 || len > 7) {
-      return;
+    if (len == 0 || len > 7 || !uq_reply_matches(&f.data.u8[1], len)) {
+      return false;
     }
     for (uint8_t i = 0; i < len; i++) {
       uq_buf[i] = f.data.u8[1 + i];
@@ -2707,16 +2755,17 @@ void RenaultTwingoGen1Battery::handle_user_query_reply(const CAN_frame& f) {
     uq_received_len = len;
     if (len == 3 && uq_buf[0] == 0x7F && uq_buf[2] == 0x78) {
       dtc_ext_step_start_ms = millis();  // the final answer follows later
-      return;
+      return true;
     }
     uq_reply_complete();
-    return;
+    return true;
   }
   if ((pci & 0xF0) == 0x10) {
-    uq_expected_len = (uint16_t)(((pci & 0x0F) << 8) | f.data.u8[1]);
-    if (uq_expected_len < 7) {
-      return;  // not a valid First Frame
+    uint16_t expected = (uint16_t)(((pci & 0x0F) << 8) | f.data.u8[1]);
+    if (expected < 7 || !uq_reply_matches(&f.data.u8[2], 6)) {
+      return false;  // not a valid First Frame, or the start of another reply (late cell polling reply)
     }
+    uq_expected_len = expected;
     uq_buf_len = 0;
     for (uint8_t i = 0; i < 6; i++) {
       uq_buf[uq_buf_len++] = f.data.u8[2 + i];
@@ -2724,11 +2773,11 @@ void RenaultTwingoGen1Battery::handle_user_query_reply(const CAN_frame& f) {
     uq_received_len = 6;
     uq_in_progress = true;
     transmit_can_frame(&ZOE_POLL_FLOW_CONTROL);
-    return;
+    return true;
   }
   if ((pci & 0xF0) == 0x20) {
     if (!uq_in_progress) {
-      return;  // stray Consecutive Frame
+      return false;  // a Consecutive Frame of some other reply
     }
     uint16_t remaining = (uint16_t)(uq_expected_len - uq_received_len);
     uint8_t n = remaining < 7 ? (uint8_t)remaining : 7;
@@ -2741,7 +2790,9 @@ void RenaultTwingoGen1Battery::handle_user_query_reply(const CAN_frame& f) {
     if (uq_received_len >= uq_expected_len) {
       uq_reply_complete();
     }
+    return true;
   }
+  return false;
 }
 
 // Drives the DTC Read/Erase probe: open an extended diagnostic session (0x10 0x03, same subfunction

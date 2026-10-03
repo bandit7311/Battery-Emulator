@@ -91,6 +91,12 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   // its backing state are private, see read_DTC() nearby in the .cpp for the matching pattern.
   void read_DTC_details();
 
+  // Steady 0x350 frame in normal operation: false = C7 like the vehicle while it is ready to drive (default),
+  // true = C3 with `14 14 96 45` as the emulator sent it before 03.10. Runtime switch on the /simulator page
+  // (diagnostic tests: some ECUs refuse to clear DTCs while the vehicle is "driving"), not stored, applies only to
+  // the steady frame, the sleep sequence and the wake burst send their own 0x350.
+  static bool steady_350_use_c3;
+
   // Free read request on the extended 29-bit protocol (03.10.), "More Battery Info" page: input field,
   // Query button, answer field. Only read services are accepted (0x22 ReadDataByIdentifier, 0x19
   // ReadDTCInformation). `hex` = request bytes as hex text (spaces allowed), e.g. "22925E". Returns "OK" when
@@ -699,7 +705,8 @@ class RenaultTwingoGen1Battery : public UdsCanBattery {
   char fdc_result[336] = "not run yet";
   bool uq_begin(uint8_t mode, const uint8_t* req, uint8_t len, bool needs_session);
   void uq_send_request();
-  void handle_user_query_reply(const CAN_frame& f);
+  bool handle_user_query_reply(const CAN_frame& f);  // false = not the reply to our request, handle it normally
+  bool uq_reply_matches(const uint8_t* p, uint8_t n) const;
   void uq_reply_complete();
   void uq_restore_poll_template();
   void handle_dtc_ext(unsigned long currentMillis);

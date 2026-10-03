@@ -7,6 +7,7 @@
 #include "../../Software/src/battery/RENAULT-TWINGO-GEN1-BATTERY.h"
 #include "../../Software/src/datalayer/datalayer.h"
 #include "../../Software/src/datalayer/datalayer_extended.h"
+#include "../../Software/src/devboard/webserver/simulator_html.h"
 
 #include "Arduino.h"
 
@@ -108,6 +109,25 @@ CAN_frame reply_frame(std::initializer_list<uint8_t> bytes) {
   f.DLC = 8;
   int i = 0;
   for (uint8_t v : bytes) {
+    f.data.u8[i++] = v;
+  }
+  return f;
+}
+
+
+// Single-frame positive reply 62 <DID> <data...> as the LBC sends it.
+CAN_frame did_reply(uint16_t did, std::initializer_list<uint8_t> data_bytes) {
+  CAN_frame f = {};
+  f.FD = false;
+  f.ext_ID = true;
+  f.ID = 0x18DAF1DB;
+  f.DLC = 8;
+  f.data.u8[0] = (uint8_t)(3 + data_bytes.size());
+  f.data.u8[1] = 0x62;
+  f.data.u8[2] = (uint8_t)(did >> 8);
+  f.data.u8[3] = (uint8_t)(did & 0xFF);
+  int i = 4;
+  for (uint8_t v : data_bytes) {
     f.data.u8[i++] = v;
   }
   return f;
@@ -391,6 +411,36 @@ TEST(TwingoSimulatorSwitches, PlannedRowsStayOffByDefaultAndSwitchOnAndOff) {
   set_mask(0x3FF);
   run(b, t, 1000, 10, log);
   EXPECT_EQ(count_id(log, 0x186), n);
+}
+
+// Every one of the 18 P/A rows (index 10-27) is its own on/off switch: ticked -> frames of exactly that ID with the
+// interval of the table row, unticked -> nothing.
+TEST(TwingoSimulatorSwitches, EveryPlannedAndAssumedRowSwitchesOnAndOff) {
+  datalayer.battery.status.voltage_dV = 3840;  // 0x42E only sends while the pack voltage is known
+  for (int row = 10; row < RenaultTwingoGen1Battery::SIM_SIGNAL_COUNT; row++) {
+    const auto& sig = RenaultTwingoGen1Battery::sim_signals[row];
+    for (int on = 0; on < 2; on++) {
+      set_mask(on ? (0x3FFu | (1u << row)) : 0x3FFu);
+      TestTwingo b;
+      b.setup();
+      uint64_t t = 1000;
+      std::vector<Tx> log;
+      run(b, t, 2000, 1, log);
+      size_t n = count_id(log, sig.id);
+      if (on) {
+        // about 2000 ms / interval frames (the table interval is the minimum spacing of the loop)
+        EXPECT_GE(n, 2000u / sig.interval_ms - 2u) << "0x" << std::hex << sig.id << " row " << std::dec << row;
+        EXPECT_LE(n, 2000u / sig.interval_ms + 2u) << "0x" << std::hex << sig.id << " row " << std::dec << row;
+        for (const Tx& x : with_id(log, sig.id)) {
+          EXPECT_EQ(x.f.DLC, sig.dlc) << "0x" << std::hex << sig.id;
+        }
+      } else {
+        EXPECT_EQ(n, 0u) << "0x" << std::hex << sig.id << " row " << std::dec << row << " must be off";
+      }
+    }
+  }
+  set_mask(0x3FF);
+  datalayer.battery.status.voltage_dV = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,4 +1091,222 @@ TEST(TwingoPage, AnswerFieldShowsTheLastResult) {
   b.handle_incoming_can_frame(reply_frame({0x06, 0x62, 0x92, 0x5E, 0x13, 0x88, 0x6F, 0x00}));
   String html = b.get_uds_info_html();
   EXPECT_TRUE(contains(html, "22 92 5E: OK 62 92 5E 13 88 6F"));
+}
+
+// ---------------------------------------------------------------------------
+// 03.10. corrections: only the reply to the request is taken
+// ---------------------------------------------------------------------------
+
+TEST(TwingoReplyMatching, LateCellPollingReplyIsNotTakenAsTheAnswer) {
+  // Screenshot case: request 22 90 05, the first reply was 62 90 72 0F 53 (cell 80 of the polling).
+  TestTwingo b;
+  b.setup();
+  set_millis64(1000);
+  ASSERT_STREQ(b.start_user_query("229005"), "OK");
+  b.handle_incoming_can_frame(did_reply(0x9072, {0x0F, 0x53}));  // not ours
+  EXPECT_STREQ(b.user_query_result(), "requested");              // still waiting
+  b.handle_incoming_can_frame(did_reply(0x9005, {0x0E, 0x55}));  // ours
+  EXPECT_STREQ(b.user_query_result(), "22 90 05: OK 62 90 05 0E 55");
+}
+
+TEST(TwingoReplyMatching, LateReplyStillReachesTheNormalHandlerAndIsNotLost) {
+  TestTwingo b;
+  b.setup();
+  set_millis64(1000);
+  ASSERT_STREQ(b.start_user_query("229005"), "OK");
+  b.handle_incoming_can_frame(did_reply(0x9072, {0x0F, 0x53}));  // cell 80 = 3831 mV, goes to the polling
+  b.handle_incoming_can_frame(did_reply(0x9005, {0x0E, 0x55}));
+  EXPECT_TRUE(contains(b.get_uds_info_html(), "22 90 05: OK 62 90 05 0E 55"));
+  EXPECT_EQ(datalayer.battery.status.cell_voltages_mV[79], 3831);
+}
+
+TEST(TwingoReplyMatching, SessionConfirmationIsNotTakenAsTheFaultCounterAnswer) {
+  // Screenshot case: the button "Read DTC fault counters (19 14)" showed OK 50 03 00 32 01 F4.
+  TestTwingo b;
+  b.setup();
+  set_millis64(1000);
+  b.read_DTC_fdc();
+  uint64_t t = 1000;
+  std::vector<Tx> log;
+  run(b, t, 300, 50, log);  // session gap over, 19 14 sent, now waiting for the reply
+  b.handle_incoming_can_frame(reply_frame({0x06, 0x50, 0x03, 0x00, 0x32, 0x01, 0xF4, 0}));
+  EXPECT_STREQ(b.fdc_query_result(), "requested");
+  b.handle_incoming_can_frame(reply_frame({0x02, 0x59, 0x14, 0, 0, 0, 0, 0}));
+  EXPECT_STREQ(b.fdc_query_result(), "OK, no DTC with a fault detection counter");
+}
+
+TEST(TwingoReplyMatching, NegativeReplyOfAnotherServiceIsIgnored) {
+  TestTwingo b;
+  b.setup();
+  set_millis64(1000);
+  ASSERT_STREQ(b.start_user_query("22925E"), "OK");
+  b.handle_incoming_can_frame(reply_frame({0x03, 0x7F, 0x19, 0x12, 0, 0, 0, 0}));  // SID 0x19, not ours
+  EXPECT_STREQ(b.user_query_result(), "requested");
+  b.handle_incoming_can_frame(reply_frame({0x03, 0x7F, 0x22, 0x31, 0, 0, 0, 0}));  // ours
+  EXPECT_STREQ(b.user_query_result(), "22 92 5E: NEGATIVE 7F 22 31 (SID 0x22, NRC 0x31)");
+}
+
+TEST(TwingoReplyMatching, FirstFrameOfAnotherReplyGoesToTheNormalPathAndFlowControlIsSentOnce) {
+  TestTwingo b;
+  b.setup();
+  set_millis64(1000);
+  ASSERT_STREQ(b.start_user_query("22925E"), "OK");
+  clear_transmitted_frames();
+  // balancing reply of the polling (DID 0x912B) starts: not ours
+  b.handle_incoming_can_frame(reply_frame({0x10, 0x0A, 0x62, 0x91, 0x2B, 0x01, 0x02, 0x03}));
+  EXPECT_STREQ(b.user_query_result(), "requested");
+  b.handle_incoming_can_frame(reply_frame({0x21, 0x04, 0x05, 0x06, 0x07, 0xAA, 0xAA, 0xAA}));
+  EXPECT_STREQ(b.user_query_result(), "requested");
+  // our own reply is still accepted afterwards
+  b.handle_incoming_can_frame(reply_frame({0x06, 0x62, 0x92, 0x5E, 0x13, 0x88, 0x6F, 0x00}));
+  EXPECT_STREQ(b.user_query_result(), "22 92 5E: OK 62 92 5E 13 88 6F");
+}
+
+TEST(TwingoReplyMatching, SecondDidOfTheRequestDoesNotMatterOnlyTheFirstIsChecked) {
+  TestTwingo b;
+  b.setup();
+  set_millis64(1000);
+  ASSERT_STREQ(b.start_user_query("22 9005 9006"), "OK");
+  b.handle_incoming_can_frame(reply_frame({0x07, 0x62, 0x90, 0x05, 0x0E, 0x55, 0x0E, 0x56}));
+  EXPECT_STREQ(b.user_query_result(), "22 90 05 90 06: OK 62 90 05 0E 55 0E 56");
+}
+
+TEST(TwingoReplyMatching, NoMatchingReplyStillEndsWithTheTimeout) {
+  TestTwingo b;
+  b.setup();
+  set_millis64(1000);
+  ASSERT_STREQ(b.start_user_query("22925E"), "OK");
+  b.handle_incoming_can_frame(did_reply(0x9072, {0x0F, 0x53}));
+  uint64_t t = 1000;
+  std::vector<Tx> log;
+  run(b, t, 2500, 100, log);
+  EXPECT_STREQ(b.user_query_result(), "no response");
+  EXPECT_STREQ(b.start_user_query("22925E"), "OK");  // channel free again
+}
+
+TEST(TwingoReplyMatching, DtcDetailsIgnoreTheSessionConfirmationToo) {
+  TestTwingo b;
+  b.setup();
+  set_millis64(1000);
+  b.read_DTC_details();
+  uint64_t t = 1000;
+  std::vector<Tx> log;
+  run(b, t, 300, 50, log);
+  b.handle_incoming_can_frame(reply_frame({0x06, 0x50, 0x03, 0x00, 0x32, 0x01, 0xF4, 0}));  // not the answer
+  b.handle_incoming_can_frame(reply_frame({0x06, 0x59, 0x06, 0xE1, 0x43, 0x81, 0x2F, 0}));
+  std::string lines = detail_lines(b.get_uds_info_html());
+  EXPECT_NE(lines.find(": OK 59 06 E1 43 81 2F<br>"), std::string::npos) << lines;
+  EXPECT_EQ(lines.find("50 03 00 32"), std::string::npos) << lines;
+}
+
+TEST(TwingoReplyMatching, ReadServiceNineteenSubFunctionMustBeEchoed) {
+  TestTwingo b;
+  b.setup();
+  set_millis64(1000);
+  ASSERT_STREQ(b.start_user_query("190209"), "OK");
+  uint64_t t = 1000;
+  std::vector<Tx> log;
+  run(b, t, 300, 50, log);
+  b.handle_incoming_can_frame(reply_frame({0x03, 0x59, 0x14, 0xFF, 0, 0, 0, 0}));  // other sub-function
+  EXPECT_STREQ(b.user_query_result(), "requested");
+  b.handle_incoming_can_frame(reply_frame({0x10, 0x0B, 0x59, 0x02, 0xFF, 0xE1, 0x43, 0x81}));
+  b.handle_incoming_can_frame(reply_frame({0x21, 0x2F, 0x1B, 0x07, 0x15, 0x2F, 0xAA, 0xAA}));
+  EXPECT_STREQ(b.user_query_result(), "19 02 09: OK 59 02 FF E1 43 81 2F 1B 07 15 2F");
+}
+
+// ---------------------------------------------------------------------------
+// 03.10. corrections: no raw '%' in the pages (the web server's template engine eats text between two of them)
+// ---------------------------------------------------------------------------
+
+TEST(TwingoPagePercent, NoRawPercentSignAnywhereOnceAllPercentValuesAreRead) {
+  TestTwingo b;
+  b.setup();
+  set_millis64(1000);
+  b.handle_incoming_can_frame(did_reply(0x9003, {0x27, 0x10}));  // SOH 100 %
+  b.handle_incoming_can_frame(did_reply(0x9001, {0x1A, 0x7E}));  // SOC
+  b.handle_incoming_can_frame(did_reply(0x9002, {0x17, 0xDA}));  // USOC
+  b.handle_incoming_can_frame(did_reply(0x91B9, {0x1B, 0x74}));  // SOC min
+  b.handle_incoming_can_frame(did_reply(0x91BA, {0x1B, 0xC5}));  // SOC max
+  CAN_frame f658 = {};
+  f658.ID = 0x658;
+  f658.DLC = 8;
+  f658.data.u8[4] = 0x5F;  // SOH candidate
+  b.handle_incoming_can_frame(f658);
+  std::string page(b.get_uds_info_html().c_str());
+  EXPECT_EQ(page.find('%'), std::string::npos) << "a raw percent sign is still in the More Battery Info page";
+  EXPECT_NE(page.find("Battery SOH avg (0x9003): 100.000 &#37;"), std::string::npos);
+  EXPECT_NE(page.find("SOH candidate (0x658 byte 4): 95 &#37;"), std::string::npos);
+  // The block that was swallowed on 03.10. is present: checkbox, DTC read and erase lines
+  EXPECT_NE(page.find("Read ALL DTC statuses (mask 0xFF)"), std::string::npos);
+  EXPECT_NE(page.find("DTC Erase (ext. protocol, Erase DTC button):"), std::string::npos);
+  EXPECT_NE(page.find("DTC Read (ext. protocol, Read DTC button):"), std::string::npos);
+}
+
+TEST(TwingoPagePercent, SimulatorPageHasNoRawPercentSignEither) {
+  std::string page(simulator_processor(String("X")).c_str());
+  ASSERT_GT(page.size(), 1000u);
+  EXPECT_EQ(page.find('%'), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// 03.10.: steady 0x350 frame C7 / C3
+// ---------------------------------------------------------------------------
+
+TEST(TwingoSteady350, DefaultIsC7AndTheSwitchChangesOnlyTheSteadyFrame) {
+  RenaultTwingoGen1Battery::steady_350_use_c3 = false;
+  TestTwingo b;
+  b.setup();
+  b.unix_set = true;
+  b.unix_now = AGE_EPOCH + 2959882LL * 60;
+  uint64_t t = 1000;
+  std::vector<Tx> log;
+  run(b, t, 300, 100, log);
+  auto f = with_id(log, 0x350);
+  ASSERT_FALSE(f.empty());
+  EXPECT_EQ(f.back().f.data.u8[0], 0xC7);
+  EXPECT_EQ(f.back().f.data.u8[5], 0x98);
+  EXPECT_EQ(f.back().f.data.u8[6], 0x94);
+  RenaultTwingoGen1Battery::steady_350_use_c3 = true;
+  log.clear();
+  run(b, t, 300, 100, log);
+  f = with_id(log, 0x350);
+  ASSERT_FALSE(f.empty());
+  // C3 as the emulator sent it before 03.10.: 14 14 96 45, age bytes stay the real minutes
+  EXPECT_TRUE(f.back().f.data.u8[0] == 0xC3 && f.back().f.data.u8[1] == 0x2D && f.back().f.data.u8[2] == 0x2A &&
+              f.back().f.data.u8[3] == 0x0A && f.back().f.data.u8[4] == 0x14 && f.back().f.data.u8[5] == 0x14 &&
+              f.back().f.data.u8[6] == 0x96 && f.back().f.data.u8[7] == 0x45);
+  RenaultTwingoGen1Battery::steady_350_use_c3 = false;
+  log.clear();
+  run(b, t, 300, 100, log);
+  f = with_id(log, 0x350);
+  EXPECT_EQ(f.back().f.data.u8[0], 0xC7);  // back to C7 at once
+}
+
+TEST(TwingoSteady350, SleepAndWakeSequencesStayTheSameWhateverIsSelected) {
+  RenaultTwingoGen1Battery::steady_350_use_c3 = true;
+  TestTwingo b;
+  b.setup();
+  uint64_t t = 1000;
+  std::vector<Tx> log;
+  run(b, t, 500, 100, log);
+  b.request_sleep();
+  log.clear();
+  run(b, t, 3000, 100, log);
+  auto f = with_id(log, 0x350);
+  ASSERT_FALSE(f.empty());
+  EXPECT_EQ(f[0].f.data.u8[0], 0xC3);  // C3 stage of the shutdown sequence, as before
+  RenaultTwingoGen1Battery::steady_350_use_c3 = false;
+}
+
+TEST(TwingoSteady350, SimulatorPageShowsTheSelectionAndItsCurrentState) {
+  RenaultTwingoGen1Battery::steady_350_use_c3 = false;
+  std::string page(simulator_processor(String("X")).c_str());
+  EXPECT_NE(page.find("id='steady350c7' checked "), std::string::npos);
+  EXPECT_EQ(page.find("id='steady350c3' checked "), std::string::npos);
+  EXPECT_NE(page.find("/editTwingoSteady350?value=1"), std::string::npos);
+  RenaultTwingoGen1Battery::steady_350_use_c3 = true;
+  page = std::string(simulator_processor(String("X")).c_str());
+  EXPECT_EQ(page.find("id='steady350c7' checked "), std::string::npos);
+  EXPECT_NE(page.find("id='steady350c3' checked "), std::string::npos);
+  RenaultTwingoGen1Battery::steady_350_use_c3 = false;
 }

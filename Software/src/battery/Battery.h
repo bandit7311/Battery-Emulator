@@ -1,6 +1,7 @@
 #ifndef BATTERY_H
 #define BATTERY_H
 
+#include <stddef.h>
 #include <vector>
 #include "../../src/devboard/utils/types.h"
 #include "../../src/devboard/webserver/BatteryHtmlRenderer.h"
@@ -105,6 +106,7 @@ class Battery {
   virtual bool supports_read_DTC() { return false; }
   virtual bool supports_measure_list() { return false; }
   virtual bool supports_quick_time_query() { return false; }
+  virtual bool supports_live_page() { return false; }
   virtual bool supports_reset_SOH() { return false; }
   virtual bool supports_reset_BECM() { return false; }
   virtual bool supports_calibrate_SOC() { return false; }
@@ -141,6 +143,14 @@ class Battery {
   virtual void read_DTC() {}
   virtual void run_measure_list() {}
   virtual void run_quick_time_query() {}
+  // Live page /kangooLive: short text for the page (key=value lines) and the actions of its buttons
+  virtual size_t live_text(char* out, size_t n) {
+    if (n > 0) {
+      out[0] = 0;
+    }
+    return 0;
+  }
+  virtual void live_action(const char* cmd, int value) {}
   virtual void reset_SOH() {}
   virtual void reset_BECM() {}
   virtual void request_open_contactors() {}

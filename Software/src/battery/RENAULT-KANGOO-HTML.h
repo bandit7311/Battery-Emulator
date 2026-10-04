@@ -5,11 +5,22 @@
 #include "../devboard/webserver/BatteryHtmlRenderer.h"
 #include "RENAULT-KANGOO-MEASURE.h"
 #include "RENAULT-KANGOO-QUICKQUERY.h"
+#include "RENAULT-KANGOO-VEHICLESTATE.h"
 
 // Values decoded by the Renault Kangoo driver that have no field in the common datalayer.
 // One instance lives inside each RenaultKangooBattery, so battery 2 shows its own data.
 struct KangooExtraData {
   bool rx_only = false;
+
+  // Vehicle state from frame 0x350 (state, minute counter, shutdown after ignition off), ages in milliseconds
+  bool vs_seen = false;
+  uint8_t vs_state = 0;
+  uint32_t vs_counter = 0;
+  uint32_t vs_state_age_ms = 0;
+  bool vs_shutdown_active = false;
+  bool vs_shutdown_finished = false;
+  uint32_t vs_shutdown_age_ms = 0;
+  uint32_t vs_bus_silent_ms = 0;
 
   // Measurement list (button on the advanced page, RX only mode): 0 = not run, 1 = running, 2 = finished
   uint8_t measure_state = 0;
@@ -87,7 +98,63 @@ class RenaultKangooHtmlRenderer : public BatteryHtmlRenderer {
     content += d.rx_only ? "RX only (nothing is transmitted, no polled values)" : "polling";
     content += "</h4>";
 
+    // Vehicle state of frame 0x350, with the shutdown after ignition off. Helps to time the button presses.
+    {
+      content += "<h4>Vehicle state 0x350: ";
+      if (!d.vs_seen) {
+        content += "not seen";
+      } else {
+        char code[8];
+        snprintf(code, sizeof(code), "%02X", (unsigned)d.vs_state);
+        content += String(code);
+        if (d.vs_shutdown_active || d.vs_shutdown_finished) {
+          const char* name = KangooVehicleState::stage_name(d.vs_state);
+          if (name[0] != 0) {
+            content += " (" + String(name) + ")";
+          }
+        }
+        content += ", " + String((unsigned long)(d.vs_state_age_ms / 1000)) + " s in this state";
+      }
+      content += "</h4>";
+      content += "<h4>Minute counter 0x350: ";
+      content += d.vs_seen ? String((unsigned long)d.vs_counter) : String("n/a");
+      content += "</h4>";
+      content += "<h4>Bus (frame 0x350): ";
+      if (!d.vs_seen) {
+        content += "no frame seen yet";
+      } else if (d.vs_bus_silent_ms >= KangooVehicleState::BUS_SILENT_MS) {
+        content += "silent for " + String((unsigned long)(d.vs_bus_silent_ms / 1000)) + " s";
+      } else {
+        content += "active";
+      }
+      content += "</h4>";
+      content += "<h4>Shutdown after ignition off: ";
+      if (d.vs_shutdown_active) {
+        // rounded to whole seconds like the reference points (C2 starts at 63.8 s and counts as 64 s)
+        const uint32_t age_s = (d.vs_shutdown_age_ms + 500) / 1000;
+        content += "running for " + String((unsigned long)age_s) + " s. Reference points of one logged shutdown: C2 at " +
+                   String((unsigned long)KangooVehicleState::REF_C2_S) + " s, C0 at " +
+                   String((unsigned long)KangooVehicleState::REF_C0_S) + " s, 00 at " +
+                   String((unsigned long)KangooVehicleState::REF_00_S) + " s, bus end at " +
+                   String((unsigned long)KangooVehicleState::REF_END_S) + " s.";
+        const char* label = nullptr;
+        uint32_t in_s = 0;
+        if (KangooVehicleState::next_reference(age_s, label, in_s)) {
+          content += " Next: " + String(label) + " in about " + String((unsigned long)in_s) + " s.";
+        } else {
+          content += " Past the last reference point.";
+        }
+      } else if (d.vs_shutdown_finished) {
+        content += "finished, the last 0x350 frame came " + String((unsigned long)((d.vs_shutdown_age_ms + 500) / 1000)) +
+                   " s after ignition off";
+      } else {
+        content += "not running";
+      }
+      content += "</h4>";
+    }
+
     if (d.rx_only) {
+      content += "<h4><a href='/kangooLive' style='color:#9fd8ff;'>Open the live page</a> (state, shutdown, time button, results)</h4>";
       content += "<h4>Measurement list: ";
       if (d.measure_state == 1) {
         content += "running...";
@@ -98,7 +165,9 @@ class RenaultKangooHtmlRenderer : public BatteryHtmlRenderer {
         content += "not run";
       }
       content += "</h4>";
-      if (d.measure_state == 1 || d.quick_state == 1) {  // refresh until the run is finished
+      // Refresh only while a run is active (about one second). The live page /kangooLive follows the shutdown without
+      // rebuilding this whole page (the reloads every 1.5 s during the shutdown made gaps in the serial log).
+      if (d.measure_state == 1 || d.quick_state == 1) {
         content += "<script>setTimeout(function(){location.reload();},1500);</script>";
       }
 

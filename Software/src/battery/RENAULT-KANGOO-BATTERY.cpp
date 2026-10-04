@@ -1,3 +1,4 @@
+#include <string.h>
 #include "RENAULT-KANGOO-BATTERY.h"
 #include <Arduino.h>
 #include "../battery/BATTERIES.h"
@@ -213,6 +214,8 @@ void RenaultKangooBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
   measure.on_frame(rx_frame.ID, rx_frame.ext_ID, rx_frame.data.u8, rx_frame.DLC);
   // Answer to the time button (LBC 0x18DAF1DB). Only evaluated while a time query is active.
   quick.on_frame(rx_frame.ID, rx_frame.ext_ID, rx_frame.data.u8, rx_frame.DLC);
+  // Vehicle state of frame 0x350 (state, minute counter, ignition off and bus end), shown on the advanced page.
+  vehicle.on_frame(rx_frame.ID, rx_frame.ext_ID, rx_frame.data.u8, rx_frame.DLC, (uint32_t)millis());
 
   switch (rx_frame.ID) {
     case 0x155:  //BMS1 (not present on the 22kWh pack)
@@ -336,7 +339,40 @@ void RenaultKangooBattery::sync_measure_extras() {
   extras.quick_raw = quick.get_raw();
 }
 
+size_t RenaultKangooBattery::live_text(char* out, size_t n) {
+  return live.format(out, n, (uint32_t)millis(), vehicle, quick.busy());
+}
+
+void RenaultKangooBattery::live_action(const char* cmd, int value) {
+  if (cmd == nullptr) {
+    return;
+  }
+  if (strcmp(cmd, "time") == 0) {
+    run_quick_time_query();
+  } else if (strcmp(cmd, "auto") == 0) {
+    live.set_auto(value != 0);
+  } else if (strcmp(cmd, "clear") == 0) {
+    live.clear_results();
+  }
+}
+
+void RenaultKangooBattery::sync_vehicle_state_extras(unsigned long currentMillis) {
+  const uint32_t now = (uint32_t)currentMillis;
+  vehicle.update(now);
+  extras.vs_seen = vehicle.seen();
+  extras.vs_state = vehicle.state();
+  extras.vs_counter = vehicle.counter();
+  extras.vs_state_age_ms = vehicle.state_age_ms(now);
+  extras.vs_shutdown_active = vehicle.shutdown_active();
+  extras.vs_shutdown_finished = vehicle.shutdown_finished();
+  extras.vs_shutdown_age_ms = vehicle.shutdown_age_ms(now);
+  extras.vs_bus_silent_ms = vehicle.bus_silent_ms(now);
+}
+
 void RenaultKangooBattery::transmit_can(unsigned long currentMillis) {
+  // Update the displayed vehicle state first: this runs in every mode and sends nothing.
+  sync_vehicle_state_extras(currentMillis);
+
   // Measurement list (button on the advanced page): read requests are sent ONLY after a button press. This sits
   // in front of the rx_only return on purpose - RX only silences the periodic traffic below, not this button.
   {
@@ -352,6 +388,18 @@ void RenaultKangooBattery::transmit_can(unsigned long currentMillis) {
       CAN_frame f = {.FD = false, .ext_ID = qreq.ext, .DLC = 8, .ID = qreq.id};
       memcpy(f.data.u8, qreq.data, 8);
       transmit_can_frame(&f);
+    }
+    // Result list and automatic schedule of the live page. The automatic schedule is OFF after every start and sends
+    // only the same request 22 92 61, one at a time, never while another request is running.
+    const uint32_t now32 = (uint32_t)currentMillis;
+    if (live.query_pending() && !quick.busy() && quick.get_state() == KangooQuickQuery::DONE) {
+      live.end_query((uint8_t)quick.get_result(),
+                     quick.get_result() == KangooQuickQuery::NEGATIVE ? quick.get_nrc() : quick.get_raw(),
+                     quick.get_attempts());
+    }
+    if (live.auto_poll(now32, vehicle, !measure.busy() && !quick.busy())) {
+      live.begin_query(now32, vehicle, true);
+      quick.request_start();
     }
     sync_measure_extras();
   }

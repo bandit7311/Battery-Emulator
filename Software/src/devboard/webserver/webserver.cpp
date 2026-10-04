@@ -49,6 +49,7 @@ static MyTimer ota_progress_timer = MyTimer(1000);
 #include "cellmonitor_html.h"
 #include "debug_logging_html.h"
 #include "events_html.h"
+#include "kangoo_live_html.h"
 #include "index_html.h"
 #include "settings_html.h"
 
@@ -190,6 +191,17 @@ void def_route_with_auth(const char* uri, AsyncWebServer& serv, WebRequestMethod
     }
     handler(request);
   });
+}
+
+// The battery (1, 2 or 3) that offers the live page /kangooLive, or nullptr.
+static Battery* find_live_battery() {
+  Battery* candidates[3] = {battery, battery2, battery3};
+  for (Battery* b : candidates) {
+    if (b && b->supports_live_page()) {
+      return b;
+    }
+  }
+  return nullptr;
 }
 
 void init_webserver() {
@@ -901,6 +913,32 @@ void init_webserver() {
   // Send a GET request to <ESP_IP>/update
   def_route_with_auth("/debug", server, HTTP_GET,
                       [](AsyncWebServerRequest* request) { request->send(200, "text/plain", "Debug: all OK."); });
+
+  // Live page of the Renault Kangoo driver (RX only, 04.10.): a fixed small page, a short text that it fetches every
+  // second and the actions of its buttons. Only offered by a battery that supports it (supports_live_page()).
+  def_route_with_auth("/kangooLive", server, HTTP_GET,
+                      [](AsyncWebServerRequest* request) { request->send(200, "text/html", kangoo_live_page); });
+  def_route_with_auth("/kangooLiveData", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    static char live_buffer[2600];  // the response copies the text, so one buffer is enough
+    Battery* live_batt = find_live_battery();
+    if (live_batt) {
+      live_batt->live_text(live_buffer, sizeof(live_buffer));
+    } else {
+      snprintf(live_buffer, sizeof(live_buffer), "state=--\nstate_age=0\ncounter=-\nbus=none\nshutdown=none\n");
+    }
+    request->send(200, "text/plain", live_buffer);
+  });
+  def_route_with_auth("/kangooLiveAction", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    Battery* live_batt = find_live_battery();
+    if (live_batt == nullptr || !request->hasParam("cmd")) {
+      request->send(400, "text/plain", "no live page");
+      return;
+    }
+    const String cmd = request->getParam("cmd")->value();
+    const int value = request->hasParam("value") ? request->getParam("value")->value().toInt() : 0;
+    live_batt->live_action(cmd.c_str(), value);
+    request->send(200, "text/plain", "OK");
+  });
 
   // Route to handle reboot command
   def_route_with_auth("/reboot", server, HTTP_GET, [](AsyncWebServerRequest* request) {

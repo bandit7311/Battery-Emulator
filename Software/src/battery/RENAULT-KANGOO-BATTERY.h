@@ -6,6 +6,8 @@
 #include "RENAULT-KANGOO-HTML.h"
 #include "RENAULT-KANGOO-MEASURE.h"
 #include "RENAULT-KANGOO-QUICKQUERY.h"
+#include "RENAULT-KANGOO-LIVE.h"
+#include "RENAULT-KANGOO-VEHICLESTATE.h"
 
 extern bool user_selected_use_estimated_SOC;
 
@@ -49,10 +51,16 @@ class RenaultKangooBattery : public CanBattery {
   // shuts down). Only offered in RX only mode, like the measurement list.
   bool supports_quick_time_query() { return rx_only; }
   void run_quick_time_query() {
-    if (!measure.busy()) {
+    if (!measure.busy() && !quick.busy()) {
+      live.begin_query((uint32_t)millis(), vehicle, false);  // remember the moment for the result list
       quick.request_start();
     }
   }
+
+  // Live page /kangooLive (RX only): text for the page and the actions of its buttons (time, auto, clear)
+  bool supports_live_page() { return rx_only; }
+  size_t live_text(char* out, size_t n);
+  void live_action(const char* cmd, int value);
 
   BatteryHtmlRenderer& get_status_renderer() { return renderer; }
 
@@ -62,9 +70,12 @@ class RenaultKangooBattery : public CanBattery {
 
   // Copies the state of the measurement list into extras so the advanced page can show it
   void sync_measure_extras();
+  void sync_vehicle_state_extras(unsigned long currentMillis);
 
   KangooMeasureList measure;
   KangooQuickQuery quick;
+  KangooVehicleState vehicle;  // state and minute counter of frame 0x350, shown on the advanced page
+  KangooLive live;             // result list of the time query and the optional automatic schedule
 
   DATALAYER_BATTERY_TYPE* datalayer_battery;
   bool* allows_contactor_closing;

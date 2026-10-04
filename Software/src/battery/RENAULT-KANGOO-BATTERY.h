@@ -4,6 +4,8 @@
 #include "../datalayer/datalayer.h"
 #include "CanBattery.h"
 #include "RENAULT-KANGOO-HTML.h"
+#include "RENAULT-KANGOO-MEASURE.h"
+#include "RENAULT-KANGOO-QUICKQUERY.h"
 
 extern bool user_selected_use_estimated_SOC;
 
@@ -33,11 +35,36 @@ class RenaultKangooBattery : public CanBattery {
   bool supports_reset_DTC() { return true; }
   void reset_DTC() { UserRequestDTCreset = true; }
 
+  // Measurement list button on the advanced page. Only offered in RX only mode, where it is the one and only
+  // thing that ever transmits: it sends a few read requests once per button press.
+  bool supports_measure_list() { return rx_only; }
+  // The two buttons never overlap: a press while the other one is active is ignored.
+  void run_measure_list() {
+    if (!quick.busy()) {
+      measure.request_start();
+    }
+  }
+
+  // Time button: ONE request 22 92 61 to the LBC, no session, can be pressed at any time (also while the vehicle
+  // shuts down). Only offered in RX only mode, like the measurement list.
+  bool supports_quick_time_query() { return rx_only; }
+  void run_quick_time_query() {
+    if (!measure.busy()) {
+      quick.request_start();
+    }
+  }
+
   BatteryHtmlRenderer& get_status_renderer() { return renderer; }
 
  private:
   // Decodes a complete, reassembled ISO-TP response (SID 0x61 + PID + data) from the LBC
   void process_iso_tp_response();
+
+  // Copies the state of the measurement list into extras so the advanced page can show it
+  void sync_measure_extras();
+
+  KangooMeasureList measure;
+  KangooQuickQuery quick;
 
   DATALAYER_BATTERY_TYPE* datalayer_battery;
   bool* allows_contactor_closing;

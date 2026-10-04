@@ -704,6 +704,14 @@ String raw_settings_processor(const String& var, BatteryEmulatorSettingsStore& s
     return settings.getBool("CANLOGUSB") ? "checked" : "";
   }
 
+  if (var == "CANLOGFLT") {
+    // Returned raw like all values here, settings_processor() escapes it for HTML. A percent sign is removed because the
+    // web server would take it for the start of a template placeholder.
+    String raw = settings.getString("CANLOGFLT");
+    raw.replace("%", "");
+    return raw;
+  }
+
   if (var == "USBENABLED") {
     return settings.getBool("USBENABLED") ? "checked" : "";
   }
@@ -2273,6 +2281,10 @@ const char* getCANInterfaceName(CAN_Interface interface) {
         <label>CAN message logging via USB serial: </label>
         <input type='checkbox' name='CANLOGUSB' value='on' %CANLOGUSB%
             title="WARNING: Causes performance issues! Log incoming/outgoing CAN messages via USB cable. Avoid if possible!" />
+
+        <label>CAN USB log filter (hex IDs): </label>
+        <input type='text' name='CANLOGFLT' value="%CANLOGFLT%" maxlength='120' placeholder='empty = log every frame'
+            title="Only used with CAN message logging via USB serial. Hex IDs or ranges separated by commas, for example 350,53B,700-7FF. ext = every 29 bit frame, std = every 11 bit frame. Start with an exclamation mark to log everything except the listed IDs. Empty = log every frame. Applies after a reboot." />
 
         )rawliteral" SD_SETTING_HTML SYSLOG_SETTING_HTML R"rawliteral(
 

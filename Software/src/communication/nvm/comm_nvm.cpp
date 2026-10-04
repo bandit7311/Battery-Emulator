@@ -231,6 +231,7 @@ void init_stored_settings() {
 
   datalayer.system.info.performance_measurement_active = settings.getBool("PERFPROFILE", false);
   datalayer.system.info.CAN_usb_logging_active = settings.getBool("CANLOGUSB", false);
+  set_usb_can_log_filter(settings.getString("CANLOGFLT", "").c_str());
   datalayer.system.info.usb_logging_active = settings.getBool("USBENABLED", false);
   datalayer.system.info.web_logging_active = settings.getBool("WEBENABLED", false);
 #ifdef SDCARD

@@ -209,6 +209,11 @@ void RenaultKangooBattery::process_iso_tp_response() {
 
 void RenaultKangooBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
 
+  // Answers to the measurement list (LBC 0x18DAF1DB, EVC 0x7EC, PEB 0x77E). Only evaluated while a run is active.
+  measure.on_frame(rx_frame.ID, rx_frame.ext_ID, rx_frame.data.u8, rx_frame.DLC);
+  // Answer to the time button (LBC 0x18DAF1DB). Only evaluated while a time query is active.
+  quick.on_frame(rx_frame.ID, rx_frame.ext_ID, rx_frame.data.u8, rx_frame.DLC);
+
   switch (rx_frame.ID) {
     case 0x155:  //BMS1 (not present on the 22kWh pack)
       datalayer_battery->status.CAN_battery_still_alive =
@@ -312,7 +317,45 @@ void RenaultKangooBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
   }
 }
 
+void RenaultKangooBattery::sync_measure_extras() {
+  extras.measure_state = (uint8_t)measure.get_state();
+  extras.measure_ok = measure.get_ok();
+  extras.measure_total = KangooMeasureList::COUNT;
+  for (uint8_t i = 0; i < KangooMeasureList::COUNT; i++) {
+    const KangooMeasureList::Answer& a = measure.answer(i);
+    extras.measure_status[i] = a.status;
+    extras.measure_len[i] = a.len;
+    extras.measure_nrc[i] = a.nrc;
+    extras.measure_raw[i] = a.raw;
+  }
+  extras.quick_state = (uint8_t)quick.get_state();
+  extras.quick_result = (uint8_t)quick.get_result();
+  extras.quick_attempts = quick.get_attempts();
+  extras.quick_len = quick.get_len();
+  extras.quick_nrc = quick.get_nrc();
+  extras.quick_raw = quick.get_raw();
+}
+
 void RenaultKangooBattery::transmit_can(unsigned long currentMillis) {
+  // Measurement list (button on the advanced page): read requests are sent ONLY after a button press. This sits
+  // in front of the rx_only return on purpose - RX only silences the periodic traffic below, not this button.
+  {
+    KangooMeasureList::Request req;
+    if (measure.poll(currentMillis, req)) {
+      CAN_frame f = {.FD = false, .ext_ID = req.ext, .DLC = 8, .ID = req.id};
+      memcpy(f.data.u8, req.data, 8);
+      transmit_can_frame(&f);
+    }
+    // Time button: one request 22 92 61, repeated once after 300 ms without an answer. Not at the same time as the list.
+    KangooQuickQuery::Request qreq;
+    if (quick.poll(currentMillis, qreq)) {
+      CAN_frame f = {.FD = false, .ext_ID = qreq.ext, .DLC = 8, .ID = qreq.id};
+      memcpy(f.data.u8, qreq.data, 8);
+      transmit_can_frame(&f);
+    }
+    sync_measure_extras();
+  }
+
   if (rx_only) {  // Never send anything on the bus in this mode - pure listener
     return;
   }

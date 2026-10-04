@@ -451,7 +451,7 @@ void init_webserver() {
 
   const char* stringSettingNames[] = {"APPASSWORD", "HOSTNAME",    "MQTTSERVER", "MQTTUSER",  "MQTTPASSWORD",
                                       "HTTPUSER",   "HTTPPASS",    "LOCALIP",    "GATEWAY",   "SUBNET",
-                                      "DNS",        "HADISCTOPIC", "SYSLOGIP",   "ESPNOWMACS"};
+                                      "DNS",        "HADISCTOPIC", "SYSLOGIP",   "ESPNOWMACS", "CANLOGFLT"};
 
   // Handles the form POST from UI to save settings of the common image
   server.on("/saveSettings", HTTP_POST,

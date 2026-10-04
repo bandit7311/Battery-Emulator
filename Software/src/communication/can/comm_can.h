@@ -5,6 +5,10 @@
 
 extern uint16_t user_selected_CAN_ID_cutoff_filter;
 
+// Sets the ID filter of the USB serial CAN log ("CAN message logging via USB serial"), see can_log_filter.h.
+// Empty text = every frame is printed. Called at boot from the stored setting CANLOGFLT.
+void set_usb_can_log_filter(const char* text);
+
 void dump_can_frame(CAN_frame& frame, CAN_Interface interface, frameDirection msgDir);
 void transmit_can_frame_to_interface(const CAN_frame* tx_frame, CAN_Interface interface);
 

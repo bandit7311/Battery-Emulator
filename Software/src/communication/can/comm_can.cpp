@@ -3,6 +3,7 @@
 #include "../../lib/pierremolinaro-ACAN2517FD/ACAN2517FD.h"
 #include "../../lib/pierremolinaro-acan-esp32/ACAN_ESP32.h"
 #include "CanReceiver.h"
+#include "can_log_filter.h"
 #include "comm_can.h"
 #include "src/datalayer/datalayer.h"
 #include "src/devboard/hal/hal.h"
@@ -65,6 +66,14 @@ static ACAN2517FDSettings* settings2517_2;
 static bool native_can_initialized = false;
 //CAN logging filter settings
 uint16_t user_selected_CAN_ID_cutoff_filter = 0;  //Messages below this ID will not be logged in webserver
+
+// ID filter of the USB serial CAN log. Empty (default) = every frame is printed. Frames that the filter
+// leaves out are not counted as dropped, so the "[N CAN frames not printed]" marker only reports real losses.
+static CanLogFilter usb_can_log_filter;
+
+void set_usb_can_log_filter(const char* text) {
+  usb_can_log_filter.parse(text);
+}
 
 bool init_CAN() {
   // Native CAN (onboard the ESP32)
@@ -492,7 +501,7 @@ static void receive_frame_canfd_addon_2() {
 // Support functions
 static void print_can_frame(CAN_frame frame, CAN_Interface interface, frameDirection msgDir) {
 
-  if (datalayer.system.info.CAN_usb_logging_active) {
+  if (datalayer.system.info.CAN_usb_logging_active && usb_can_log_filter.matches(frame.ID, frame.ext_ID)) {
     // Build the whole line first, then write it in one go - and only if the TX
     // buffer has room. This path runs in the core task: a blocked/slow USB host
     // must never stall it (EVENT_TASK_OVERRUN). Frames that don't fit are

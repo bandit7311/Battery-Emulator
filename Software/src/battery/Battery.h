@@ -103,6 +103,8 @@ class Battery {
   virtual bool supports_sleep_control() { return false; }
   virtual bool supports_reset_DTC() { return false; }
   virtual bool supports_read_DTC() { return false; }
+  virtual bool supports_measure_list() { return false; }
+  virtual bool supports_quick_time_query() { return false; }
   virtual bool supports_reset_SOH() { return false; }
   virtual bool supports_reset_BECM() { return false; }
   virtual bool supports_calibrate_SOC() { return false; }
@@ -137,6 +139,8 @@ class Battery {
   virtual void request_wake_up() {}
   virtual void reset_DTC() {}
   virtual void read_DTC() {}
+  virtual void run_measure_list() {}
+  virtual void run_quick_time_query() {}
   virtual void reset_SOH() {}
   virtual void reset_BECM() {}
   virtual void request_open_contactors() {}
